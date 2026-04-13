@@ -1,0 +1,72 @@
+// Minimal broker proto for karpenter-provider-rafay. Wire format matches edge-common rep.edge.v1
+// for EdgeCommand on EdgeCommandService.Execute (same bidi stream as edge-client).
+syntax = "proto3";
+
+package rep.edge.v1;
+
+option go_package = "github.com/RafaySystems/karpenter-provider-rafay/pkg/brokerproto";
+
+// --- Enums (field numbers must match edge-common where applicable) ---
+enum EdgeCommandType {
+  EdgeCommandTypeIgnore = 0;
+  KarpenterAddNode = 17;
+  KarpenterRemoveNode = 18;
+}
+
+enum EdgeMessageType {
+  EdgeMessageTypeIgnore = 0;
+  KarpenterAddNodeRequest = 33;
+  KarpenterAddNodeResponse = 34;
+  KarpenterRemoveNodeRequest = 35;
+  KarpenterRemoveNodeResponse = 36;
+}
+
+// Status matches rep.edge.v1.Status (edge-common).
+enum Status {
+  Accepted = 0;
+  Success = 1;
+  Failed = 2;
+  Timeout = 3;
+}
+
+// --- Payloads: must match rep.edge.v1.KarpenterAddNodeCommand / KarpenterRemoveNodeCommand (edge-common edge.proto). ---
+message KarpenterAddNodeCommand {
+  string edge_id = 1;
+  string stream_id = 2;
+  string cluster_id = 3;
+  string project_id = 4;
+  string instance_type = 5;
+  string node_pool_name = 6;
+}
+
+message KarpenterRemoveNodeCommand {
+  string edge_id = 1;
+  string stream_id = 2;
+  string provider_id = 3;
+}
+
+// EdgeCommand is what edge-client receives on EdgeCommandService.Execute (stream).
+// Fields 1–4 and 14 align with edge-common; 21–22 carry Karpenter ops (same wire as extended edge-common).
+message EdgeCommand {
+  EdgeCommandType command_type = 1;
+  EdgeMessageType message_type = 2;
+  string data = 3;
+  Status status = 4;
+  string rid = 14;
+  KarpenterAddNodeCommand karpenter_add_node_command = 21;
+  KarpenterRemoveNodeCommand karpenter_remove_node_command = 22;
+}
+
+// Response bodies serialized into EdgeCommand.data for Karpenter*Response message types.
+message AddNodeResponsePayload {
+  repeated string provider_ids = 1;
+}
+
+message RemoveNodeResponsePayload {
+  bool success = 1;
+}
+
+// Same service name / method as edge-client: rep.edge.v1.EdgeCommandService.Execute
+service EdgeCommandService {
+  rpc Execute(stream EdgeCommand) returns (stream EdgeCommand);
+}

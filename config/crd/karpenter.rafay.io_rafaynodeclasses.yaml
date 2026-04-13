@@ -1,0 +1,32 @@
+# RafayNodeClass CRD for Karpenter provider (private cloud).
+# Karpenter core CRDs (NodeClaim, NodePool) live in this directory as karpenter.sh_*.yaml (v1.4.0).
+# Apply all: kubectl apply -f config/crd/
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: rafaynodeclasses.karpenter.rafay.io
+spec:
+  group: karpenter.rafay.io
+  names:
+    kind: RafayNodeClass
+    listKind: RafayNodeClassList
+    plural: rafaynodeclasses
+    singular: rafaynodeclass
+    shortNames:
+      - rnc
+      - rncs
+  scope: Cluster
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          x-kubernetes-preserve-unknown-fields: true
+      additionalPrinterColumns:
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp

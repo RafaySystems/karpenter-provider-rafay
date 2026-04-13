@@ -1,0 +1,9 @@
+# Holds leader-election Lease objects only. Pod stays in rafay-system; Rafay drift webhook blocks
+# Lease create/update in rafay-system, so LEADER_ELECTION_NAMESPACE must point here (or another allowed ns).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: karpenter
+  labels:
+    app.kubernetes.io/name: karpenter-provider-rafay
+    app.kubernetes.io/component: leader-election

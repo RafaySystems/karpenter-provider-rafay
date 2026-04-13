@@ -1,0 +1,31 @@
+# Example workload to encourage Karpenter to create a NodeClaim:
+# the requests are larger than typical existing nodes, so the pod stays Pending
+# until Karpenter provisions capacity (NodePool + RafayNodeClass + controller required).
+#
+# Apply: kubectl apply -f examples/pause-high-requests-pod.yaml
+# Watch:  kubectl get nodeclaims -w
+# Remove: kubectl delete -f examples/pause-high-requests-pod.yaml
+#
+# Requests must fit an instance type from your RafayNodeClass (defaults include up to
+# standard-48-96). Tune .spec.containers[0].resources.requests if scheduling fails.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pause-high-requests
+  namespace: default
+  labels:
+    app: pause-high-requests
+spec:
+  # Standard pause container; no ports, minimal image.
+  containers:
+    - name: pause
+      image: registry.k8s.io/pause:3.9
+      resources:
+        requests:
+          # Adjust upward if your nodes are large enough to absorb this without provisioning.
+          cpu: "32"
+          memory: "64Gi"
+        limits:
+          cpu: "32"
+          memory: "64Gi"
+  restartPolicy: Always

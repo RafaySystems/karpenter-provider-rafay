@@ -1,0 +1,95 @@
+# Deploy the Rafay Karpenter provider controller into rafay-system (must already exist; same as edge-client).
+# Set the image to your registry (e.g. output of `make docker-build` / `make push-it`).
+#
+# Apply: kubectl apply -f config/deploy   (plain manifests; do not put kustomization.yaml in this dir)
+# Kustomize: kubectl apply -k config      (uses ../kustomization.yaml)
+#
+# Install order: apply config/crd/ (NodeClaim, NodePool, RafayNodeClass) BEFORE starting the controller.
+# If the controller started before NodeClaim CRDs existed, restart the pod so Karpenter can register
+# the field index on status.providerID (otherwise you see "Index ... field:status.providerID does not exist").
+#
+# Edge-broker only: TLS Secret + env aligned with edge-client Deployment.
+#
+# Leader election: LEADER_ELECTION_NAMESPACE is karpenter (see namespace-karpenter-leader.yaml), not rafay-system,
+# because Rafay admission webhook rafay.drift.validate rejects Lease writes in rafay-system.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: karpenter-provider-rafay
+  namespace: rafay-system
+  labels:
+    app.kubernetes.io/name: karpenter-provider-rafay
+    app.kubernetes.io/component: controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: karpenter-provider-rafay
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: karpenter-provider-rafay
+        app.kubernetes.io/component: controller
+    spec:
+      serviceAccountName: karpenter-provider-rafay
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+        - name: controller
+          image: karpenter-provider-rafay:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: LEADER_ELECTION_NAMESPACE
+              value: "karpenter"
+            # Secured gRPC: same TLS + port env as edge-client (client.crt OU host, EDGE_CLIENT_SERVER_PORT).
+            - name: EDGE_CLIENT_CERT_FOLDER
+              value: "/opt/rcloud/certs"
+            - name: EDGE_CLIENT_SERVER_PORT
+              value: "443"
+            # If EdgeCommandService is only on internal plaintext :5449, set:
+            # - name: EDGE_BROKER_GRPC_INSECURE
+            #   value: "true"
+            # - name: EDGE_BROKER_GRPC_PORT
+            #   value: "5449"
+            # - name: EDGE_BROKER_GRPC_HOST
+            #   value: "edge-broker.rafay-system.svc.cluster.local"
+            # Optional: broker uses client.crt O= for identity; only for logging if set.
+            - name: EDGE_ID
+              value: ""
+            # Optional: gRPC sessionid (auto-generated UUID per controller start like edge-client NewID(); match edge-client log "using session" if broker requires it).
+            - name: STREAM_ID
+              value: ""
+            - name: RAFAY_CLUSTER_ID
+              value: ""
+            - name: RAFAY_PROJECT_ID
+              value: ""
+            # CERT_FOLDER overrides EDGE_CLIENT_CERT_FOLDER; SERVER_PORT overrides EDGE_CLIENT_SERVER_PORT.
+          envFrom:
+            - secretRef:
+                name: karpenter-provider-rafay
+                optional: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          volumeMounts:
+            - name: edge-certs
+              mountPath: /opt/rcloud/certs
+              readOnly: true
+      volumes:
+        - name: edge-certs
+          secret:
+            secretName: edge-client-creds
+            items:
+              - key: client.crt
+                path: client.crt
+              - key: client.key
+                path: client.key
+              - key: ca.crt
+                path: ca.crt

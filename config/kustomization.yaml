@@ -1,0 +1,17 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# No global namespace: — rafay-system is not declared here (platform provides it). karpenter is for leader-election only.
+# Namespaced resources set metadata.namespace in deploy/*.yaml.
+
+resources:
+  - deploy/namespace-karpenter-leader.yaml
+  - deploy/serviceaccount.yaml
+  - deploy/rbac.yaml
+  - deploy/deployment.yaml
+
+# Override image after build, e.g.:
+# images:
+#   - name: karpenter-provider-rafay
+#     newName: registry.dev.rafay-edge.net/myuser/karpenter-provider-rafay
+#     newTag: main-20260403-1200

@@ -1,0 +1,57 @@
+# ClusterRole for Karpenter core controllers + RafayNodeClass.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: karpenter-provider-rafay
+  labels:
+    app.kubernetes.io/name: karpenter-provider-rafay
+rules:
+  # Karpenter CRDs
+  - apiGroups: ["karpenter.sh"]
+    resources: ["nodeclaims", "nodeclaims/status", "nodepools", "nodepools/status"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Rafay node class
+  - apiGroups: ["karpenter.rafay.io"]
+    resources: ["rafaynodeclasses", "rafaynodeclasses/status"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Cluster capacity and workloads
+  - apiGroups: [""]
+    resources: ["nodes", "nodes/status", "pods", "pods/eviction", "events", "persistentvolumes", "persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["namespaces", "configmaps", "secrets", "serviceaccounts"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["daemonsets", "deployments", "replicasets", "statefulsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch"]
+  # Storage / CSI (Karpenter watches these for scheduling; without this: VolumeAttachment list forbidden)
+  - apiGroups: ["storage.k8s.io"]
+    resources:
+      - volumeattachments
+      - csinodes
+      - csidrivers
+      - storageclasses
+      - csistoragecapacities
+    verbs: ["get", "list", "watch"]
+  # Leader election
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: karpenter-provider-rafay
+  labels:
+    app.kubernetes.io/name: karpenter-provider-rafay
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: karpenter-provider-rafay
+subjects:
+  - kind: ServiceAccount
+    name: karpenter-provider-rafay
+    namespace: rafay-system
