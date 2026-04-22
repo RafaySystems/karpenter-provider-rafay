@@ -3,8 +3,13 @@ kind: Kustomization
 
 # No global namespace: — rafay-system is not declared here (platform provides it). karpenter is for leader-election only.
 # Namespaced resources set metadata.namespace in deploy/*.yaml.
+#
+# Apply: kubectl apply -k config   (not kubectl apply -f config/kustomization.yaml)
 
 resources:
+  - crd/karpenter.sh_nodepools.yaml
+  - crd/karpenter.sh_nodeclaims.yaml
+  - crd/karpenter.rafay.io_rafaynodeclasses.yaml
   - deploy/namespace-karpenter-leader.yaml
   - deploy/serviceaccount.yaml
   - deploy/rbac.yaml

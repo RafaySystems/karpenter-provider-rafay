@@ -97,6 +97,7 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 		InstanceType: selected.Name,
 		Count:        1,
 		NodePoolName: nodeClaim.Labels[karpv1.NodePoolLabelKey],
+		OperationID:  string(nodeClaim.UID),
 	})
 	if err != nil {
 		return nil, cloudprovider.NewCreateError(err, "AddNodesFailed", err.Error())
@@ -122,7 +123,7 @@ func (c *CloudProvider) Delete(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 	if nodeClaim == nil || nodeClaim.Status.ProviderID == "" {
 		return cloudprovider.NewNodeClaimNotFoundError(fmt.Errorf("nodeclaim has no provider ID"))
 	}
-	err := c.client.RemoveNode(ctx, nodeClaim.Status.ProviderID)
+	err := c.client.RemoveNode(ctx, nodeClaim.Status.ProviderID, string(nodeClaim.UID))
 	if err != nil {
 		if errors.Is(err, rafay.ErrNodeNotFound) {
 			return cloudprovider.NewNodeClaimNotFoundError(err)

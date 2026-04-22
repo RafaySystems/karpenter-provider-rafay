@@ -1,4 +1,5 @@
 /bin/
+.gomodcache/
 *.exe
 .idea/
 .vscode/

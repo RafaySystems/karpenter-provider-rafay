@@ -1,0 +1,4 @@
+FROM gcr.io/distroless/static:debug
+COPY karpenter-provider-rafay.big /karpenter-provider-rafay
+USER nonroot
+ENTRYPOINT ["/karpenter-provider-rafay"]

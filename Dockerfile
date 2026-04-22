@@ -1,25 +1,37 @@
-# Build stage: Rafay registry proxy for base image
-# BuildKit sets TARGETOS/TARGETARCH from `docker build --platform ...` (use --platform to match cluster CPU).
-FROM --platform=$BUILDPLATFORM registry-proxy.dev.rafay-edge.net/golang:1.24 AS builder
+# syntax=docker/dockerfile:1.6
+# go.mod replace: ../edge-common → /edge-common (sibling of /workspace). Build with:
+#   docker build --build-context edgecommon=../edge-common --build-arg BUILD_USR=... --build-arg BUILD_PWD=...
+FROM --platform=$BUILDPLATFORM registry-proxy.dev.rafay-edge.net/golang:1.24-alpine3.20 as builder
 
-WORKDIR /src
+RUN apk add --no-cache git build-base
 
-# Copy dependency manifests first for better layer caching
-COPY go.mod go.sum ./
-RUN go mod download
+COPY --from=edgecommon . /edge-common
 
-# Copy source only (avoids "Copy file '.' excluded by .dockerignore" warning)
-COPY cmd ./cmd
-COPY pkg ./pkg
-ARG TARGETOS
+WORKDIR /workspace
+
+ARG BUILD_USR
+ARG BUILD_PWD
+
+COPY . ./
+
+RUN test -n "${BUILD_USR}" && \
+    test -n "${BUILD_PWD}" && \
+    echo machine github.com login ${BUILD_USR} password ${BUILD_PWD} > ~/.netrc && \
+    chmod 400 ~/.netrc && \
+    GOPRIVATE='github.com/RafaySystems/*' go mod download
+
+ARG TARGETARCH TARGETOS
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags "-X google.golang.org/protobuf/reflect/protoregistry.conflictPolicy=warn" -a -o karpenter-provider-rafay.big ./cmd/controller
+
+RUN [ "$TARGETARCH" = "amd64" ] && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test -ldflags "-X google.golang.org/protobuf/reflect/protoregistry.conflictPolicy=warn" -count=1 -short ./pkg/... ./cmd/... || echo 'arm64 platform'
+
+FROM --platform=$BUILDPLATFORM registry-proxy.dev.rafay-edge.net/rafaysystems/upx:latest AS upx
+WORKDIR /workspace
+COPY --from=builder /workspace/karpenter-provider-rafay.big .
 ARG TARGETARCH
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
-    -ldflags="-w -s" \
-    -o /karpenter-provider-rafay \
-    ./cmd/controller
+RUN [ "${TARGETARCH}" = "amd64" ] && upx --best --lzma -o /workspace/karpenter-provider-rafay.upx /workspace/karpenter-provider-rafay.big || cp /workspace/karpenter-provider-rafay.big /workspace/karpenter-provider-rafay.upx
 
-# Runtime stage: minimal image (TLS to edge-broker uses system certs)
 FROM gcr.io/distroless/static:latest
-USER nonroot:nonroot
-COPY --from=builder /karpenter-provider-rafay /karpenter-provider-rafay
+USER nonroot
 ENTRYPOINT ["/karpenter-provider-rafay"]
+COPY --from=upx /workspace/karpenter-provider-rafay.upx /karpenter-provider-rafay

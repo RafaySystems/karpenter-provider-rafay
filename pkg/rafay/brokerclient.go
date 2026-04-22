@@ -23,39 +23,29 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
+	v1 "github.com/RafaySystems/edge-common/pkg/edge/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/proto"
 
 	"github.com/RafaySystems/karpenter-provider-rafay/pkg/broker"
-	"github.com/RafaySystems/karpenter-provider-rafay/pkg/brokerproto"
 	"k8s.io/klog/v2"
 )
 
 const (
-	// Same bidi RPC as edge-client: rep.edge.v1.EdgeCommandService.Execute
-	edgeCommandExecutePath = "/rep.edge.v1.EdgeCommandService/Execute"
 	// gRPC metadata key for stream routing (edge-common/pkg/common.SessionID).
 	grpcMetadataSessionID = "sessionid"
 
-	pollTimeout = 15 * time.Minute
+	pollTimeout = 60 * time.Minute
 
 	defaultEdgeClientTLSPort = 5448
 	defaultEdgeBrokerRPCPort = 5449
 )
 
-var edgeCommandStreamDesc = &grpc.StreamDesc{
-	StreamName:    "Execute",
-	ClientStreams: true,
-	ServerStreams: true,
-}
-
-// BrokerClient talks to edge-broker using EdgeCommandService (same secured dial and
-// EdgeCommand messages as edge-client), not EdgeBrokerService.
-// It keeps one long-lived *grpc.ClientConn; each add/remove opens a short bidi stream on that connection.
+// BrokerClient talks to edge-broker over the same TLS/insecure dial as before; node add/remove use
+// rep.edge.v1.KarpenterNodeService.StreamOperations (not EdgeCommandService).
+// It keeps one long-lived *grpc.ClientConn; each add/remove opens a dedicated bidi stream on that connection.
 type BrokerClient struct {
 	CertPath     string
 	KeyPath      string
@@ -193,74 +183,37 @@ func (c *BrokerClient) streamContext(ctx context.Context) context.Context {
 	return metadata.AppendToOutgoingContext(ctx, grpcMetadataSessionID, sid)
 }
 
-// AddNodes sends KarpenterAddNodeRequest on EdgeCommandService.Execute and waits for the matching response.
+// AddNodes uses KarpenterNodeService.StreamOperations: node_add then status polls until provider IDs are returned.
 func (c *BrokerClient) AddNodes(ctx context.Context, req AddNodesRequest) (*AddNodesResponse, error) {
+	klog.Info("AddNodes", "pollTimeout", pollTimeout, "streamID", c.StreamID, "operationID", req.OperationID, "instanceType", req.InstanceType, "nodePool", req.NodePoolName, "clusterID", req.ClusterID, "projectID", req.ProjectID)
 	if strings.TrimSpace(c.StreamID) == "" {
 		return nil, fmt.Errorf("STREAM_ID is required (gRPC metadata sessionid for edge-broker)")
 	}
 	var out *AddNodesResponse
 	err := c.callBroker(ctx, func(cc *grpc.ClientConn) error {
-		rid := uuid.NewString()
-		sctx := c.streamContext(ctx)
-		deadline := time.Now().Add(pollTimeout)
-		return runEdgeCommandStream(sctx, cc, func(stream grpc.ClientStream) error {
-			cmd := &brokerproto.EdgeCommand{
-				CommandType: brokerproto.EdgeCommandType_KarpenterAddNode,
-				MessageType: brokerproto.EdgeMessageType_KarpenterAddNodeRequest,
-				Rid:         rid,
-				KarpenterAddNodeCommand: &brokerproto.KarpenterAddNodeCommand{
-					EdgeId:       strings.TrimSpace(c.EdgeID),
-					StreamId:     strings.TrimSpace(c.StreamID),
-					ClusterId:    req.ClusterID,
-					ProjectId:    req.ProjectID,
-					InstanceType: req.InstanceType,
-					NodePoolName: req.NodePoolName,
-				},
-			}
-			if err := stream.SendMsg(cmd); err != nil {
-				klog.Errorf("edge-broker: KarpenterAddNode SendMsg failed rid=%s: %v", rid, err)
-				return err
-			}
-			klog.Infof("edge-broker: KarpenterAddNode request sent rid=%s instanceType=%q nodePool=%q", rid, req.InstanceType, req.NodePoolName)
-			for time.Now().Before(deadline) {
-				select {
-				case <-ctx.Done():
-					klog.Warningf("edge-broker: KarpenterAddNode context cancelled rid=%s: %v", rid, ctx.Err())
-					return ctx.Err()
-				default:
-				}
-				msg := &brokerproto.EdgeCommand{}
-				if err := stream.RecvMsg(msg); err != nil {
-					klog.Errorf("edge-broker: KarpenterAddNode RecvMsg rid=%s: %v", rid, err)
-					return err
-				}
-				if msg.GetRid() != rid {
-					klog.V(4).Infof("edge-broker: KarpenterAddNode skipping message rid=%s (want %s)", msg.GetRid(), rid)
-					continue
-				}
-				if msg.GetMessageType() != brokerproto.EdgeMessageType_KarpenterAddNodeResponse {
-					klog.V(4).Infof("edge-broker: KarpenterAddNode skipping message type %v (want AddNodeResponse)", msg.GetMessageType())
-					continue
-				}
-				if msg.GetStatus() == brokerproto.Status_Failed {
-					return fmt.Errorf("broker add node failed: %s", msg.GetData())
-				}
-				pl := &brokerproto.AddNodeResponsePayload{}
-				if d := msg.GetData(); d != "" {
-					if err := proto.Unmarshal([]byte(d), pl); err != nil {
-						return fmt.Errorf("unmarshal add-node response: %w", err)
-					}
-				}
-				if len(pl.GetProviderIds()) == 0 {
-					return fmt.Errorf("broker add node: no provider IDs in response")
-				}
-				out = &AddNodesResponse{ProviderIDs: pl.GetProviderIds()}
-				klog.Infof("edge-broker: KarpenterAddNode response ok rid=%s providerIDs=%v", rid, pl.GetProviderIds())
-				return nil
-			}
-			klog.Warningf("edge-broker: KarpenterAddNode timed out rid=%s after %v (no matching response)", rid, pollTimeout)
-			return fmt.Errorf("broker add node: timeout after %v", pollTimeout)
-		})
+		pollCtx, cancel := context.WithTimeout(c.streamContext(ctx), pollTimeout)
+		defer cancel()
+		addReq := &v1.KarpenterNodeAddRequest{
+			ClusterId:    req.ClusterID,
+			ProjectId:    req.ProjectID,
+			InstanceType: req.InstanceType,
+			NodePoolName: req.NodePoolName,
+		}
+		if strings.TrimSpace(req.OperationID) == "" {
+			return fmt.Errorf("OperationID is required for Karpenter node add (broker requires operation_id)")
+		}
+		klog.Infof("edge-broker: KarpenterNode add stream instanceType=%q nodePool=%q operationID=%q", req.InstanceType, req.NodePoolName, req.OperationID)
+		ids, err := streamKarpenterNodeAdd(pollCtx, cc, strings.TrimSpace(c.StreamID), strings.TrimSpace(req.OperationID), addReq)
+		if err != nil {
+			klog.Errorf("edge-broker: KarpenterNode add stream failed: %v", err)
+			return err
+		}
+		if len(ids) == 0 {
+			return fmt.Errorf("broker add node: no provider IDs in response")
+		}
+		out = &AddNodesResponse{ProviderIDs: ids}
+		klog.Infof("edge-broker: KarpenterNode add ok providerIDs=%v", ids)
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -268,72 +221,26 @@ func (c *BrokerClient) AddNodes(ctx context.Context, req AddNodesRequest) (*AddN
 	return out, nil
 }
 
-// RemoveNode sends KarpenterRemoveNodeRequest on EdgeCommandService.Execute.
-func (c *BrokerClient) RemoveNode(ctx context.Context, providerID string) error {
+// RemoveNode uses KarpenterNodeService.StreamOperations: node_delete then status polls until success.
+func (c *BrokerClient) RemoveNode(ctx context.Context, providerID, operationID string) error {
 	if strings.TrimSpace(c.StreamID) == "" {
 		return fmt.Errorf("STREAM_ID is required (gRPC metadata sessionid for edge-broker)")
 	}
-	return c.callBroker(ctx, func(cc *grpc.ClientConn) error {
-		rid := uuid.NewString()
-		sctx := c.streamContext(ctx)
-		deadline := time.Now().Add(pollTimeout)
-		return runEdgeCommandStream(sctx, cc, func(stream grpc.ClientStream) error {
-			cmd := &brokerproto.EdgeCommand{
-				CommandType: brokerproto.EdgeCommandType_KarpenterRemoveNode,
-				MessageType: brokerproto.EdgeMessageType_KarpenterRemoveNodeRequest,
-				Rid:         rid,
-				KarpenterRemoveNodeCommand: &brokerproto.KarpenterRemoveNodeCommand{
-					EdgeId:     strings.TrimSpace(c.EdgeID),
-					StreamId:   strings.TrimSpace(c.StreamID),
-					ProviderId: providerID,
-				},
-			}
-			if err := stream.SendMsg(cmd); err != nil {
-				klog.Errorf("edge-broker: KarpenterRemoveNode SendMsg failed rid=%s: %v", rid, err)
-				return err
-			}
-			klog.Infof("edge-broker: KarpenterRemoveNode request sent rid=%s providerID=%q", rid, providerID)
-			for time.Now().Before(deadline) {
-				select {
-				case <-ctx.Done():
-					klog.Warningf("edge-broker: KarpenterRemoveNode context cancelled rid=%s: %v", rid, ctx.Err())
-					return ctx.Err()
-				default:
-				}
-				msg := &brokerproto.EdgeCommand{}
-				if err := stream.RecvMsg(msg); err != nil {
-					klog.Errorf("edge-broker: KarpenterRemoveNode RecvMsg rid=%s: %v", rid, err)
-					return err
-				}
-				if msg.GetRid() != rid {
-					klog.V(4).Infof("edge-broker: KarpenterRemoveNode skipping message rid=%s (want %s)", msg.GetRid(), rid)
-					continue
-				}
-				if msg.GetMessageType() != brokerproto.EdgeMessageType_KarpenterRemoveNodeResponse {
-					klog.V(4).Infof("edge-broker: KarpenterRemoveNode skipping message type %v (want RemoveNodeResponse)", msg.GetMessageType())
-					continue
-				}
-				if msg.GetStatus() == brokerproto.Status_Failed {
-					return fmt.Errorf("broker remove node failed: %s", msg.GetData())
-				}
-				klog.Infof("edge-broker: KarpenterRemoveNode response ok rid=%s", rid)
-				return nil
-			}
-			klog.Warningf("edge-broker: KarpenterRemoveNode timed out rid=%s after %v (no matching response)", rid, pollTimeout)
-			return fmt.Errorf("broker remove node: timeout after %v", pollTimeout)
-		})
-	})
-}
-
-func runEdgeCommandStream(ctx context.Context, cc *grpc.ClientConn, fn func(grpc.ClientStream) error) error {
-	stream, err := cc.NewStream(ctx, edgeCommandStreamDesc, edgeCommandExecutePath)
-	if err != nil {
-		klog.Errorf("edge-broker: NewStream %s failed: %v", edgeCommandExecutePath, err)
-		return err
+	if strings.TrimSpace(operationID) == "" {
+		return fmt.Errorf("operationID is required for Karpenter node delete (broker requires operation_id)")
 	}
-	klog.V(2).Infof("edge-broker: opened bidi stream %s", edgeCommandExecutePath)
-	defer func() { _ = stream.CloseSend() }()
-	return fn(stream)
+	return c.callBroker(ctx, func(cc *grpc.ClientConn) error {
+		pollCtx, cancel := context.WithTimeout(c.streamContext(ctx), pollTimeout)
+		defer cancel()
+		delReq := &v1.KarpenterNodeDeleteRequest{ProviderId: providerID}
+		klog.Infof("edge-broker: KarpenterNode delete stream providerID=%q operationID=%q", providerID, operationID)
+		if err := streamKarpenterNodeDelete(pollCtx, cc, strings.TrimSpace(c.StreamID), strings.TrimSpace(operationID), delReq); err != nil {
+			klog.Errorf("edge-broker: KarpenterNode delete stream failed: %v", err)
+			return err
+		}
+		klog.Infof("edge-broker: KarpenterNode delete ok providerID=%q", providerID)
+		return nil
+	})
 }
 
 // GetNode is not implemented via broker; CloudProvider falls back to the Kubernetes API.

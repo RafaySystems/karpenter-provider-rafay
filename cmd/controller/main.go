@@ -128,7 +128,9 @@ func main() {
 		op.GetClient(),
 		op.EventRecorder,
 		cloudProvider,
+		cp,
 		clusterState,
+		op.InstanceTypeStore,
 	)
 	allCtrls := make([]controller.Controller, 0, 1+len(coreCtrls))
 	allCtrls = append(allCtrls, rafaynodeclassctrl.NewController(op.GetClient()))

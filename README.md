@@ -12,7 +12,7 @@ This provider integrates [Karpenter](https://karpenter.sh) with Rafay for privat
 
 ### 1. Install CRDs
 
-Install Karpenter core CRDs (NodeClaim, NodePool from upstream **v1.4.0**) and the Rafay `RafayNodeClass` CRD:
+Install Karpenter core CRDs (NodeClaim, NodePool from upstream **v1.11.1**, matching `go.mod`) and the Rafay `RafayNodeClass` CRD:
 
 ```bash
 kubectl apply -f config/crd/

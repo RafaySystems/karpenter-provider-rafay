@@ -26,11 +26,13 @@ type Client interface {
 	// It returns the provider ID(s) of the node(s) being added (e.g. "rafay://cluster-id/node-id").
 	// The node may not be registered in the cluster immediately; the returned provider ID
 	// is used by Karpenter to track the NodeClaim until the node appears.
+	// AddNodesRequest.OperationID is required by the broker.
 	AddNodes(ctx context.Context, req AddNodesRequest) (*AddNodesResponse, error)
 
 	// RemoveNode requests Rafay to remove the node identified by providerID from the cluster.
+	// operationID is sent to the broker (required); use a stable id per delete (e.g. NodeClaim UID).
 	// Returns nil when the node is removed or already gone; returns NodeNotFound when appropriate.
-	RemoveNode(ctx context.Context, providerID string) error
+	RemoveNode(ctx context.Context, providerID, operationID string) error
 
 	// GetNode returns info for the node with the given provider ID, or nil if not found.
 	GetNode(ctx context.Context, providerID string) (*NodeInfo, error)
@@ -41,12 +43,15 @@ type Client interface {
 
 // AddNodesRequest parameters for adding nodes via Rafay API.
 type AddNodesRequest struct {
-	ClusterID   string
-	ProjectID   string
+	ClusterID    string
+	ProjectID    string
 	InstanceType string
-	Count       int
+	Count        int
 	// NodePoolName can be used by Rafay to target a specific node pool.
 	NodePoolName string
+	// OperationID is required: sent as KarpenterNodeStreamClientToBroker.operation_id (e.g. NodeClaim UID)
+	// for idempotent adds and broker correlation across restarts.
+	OperationID string
 }
 
 // AddNodesResponse returned after requesting node addition.

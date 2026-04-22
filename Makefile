@@ -1,32 +1,76 @@
-# Default local image tag (override: make build IMG=myrepo/karpenter-provider-rafay:v1)
 IMG ?= karpenter-provider-rafay:latest
+LDFLAGS := "-X google.golang.org/protobuf/reflect/protoregistry.conflictPolicy=warn"
 
-# Dev registry and tag: registry.dev.rafay-edge.net/<user>/karpenter-provider-rafay:<branch>-<date>-<time>
-# If git has no branch name (detached HEAD, not a repo), use "main" so the tag is never ":-<date>".
-DEV_USER ?= $(USER)
-DEV_TAG := registry.dev.rafay-edge.net/$(DEV_USER)/karpenter-provider-rafay:$(shell b=$$(git branch --show-current 2>/dev/null | tr "/" "-"); if [ -z "$$b" ]; then b=main; fi; echo $$b)-$(shell /bin/date "+%Y%m%d-%H%M")
+# go.mod replace: ../edge-common — pass --build-context edgecommon=$(EDGE_COMMON_DIR)
+EDGE_COMMON_DIR ?= ../edge-common
 
-# Build the controller binary
+DEV_USER ?= ${USER}
+DEV_TAG := registry.dev.rafay-edge.net/${DEV_USER}/karpenter-provider-rafay:$(shell git branch --show-current | tr "/" "-")-$(shell /bin/date "+%Y%m%d-%H%M")
+
+.PHONY: update-deps
+update-deps:
+	GOPRIVATE=github.com/RafaySystems/* go get -d github.com/RafaySystems/rafay-common@master
+	GOPRIVATE=github.com/RafaySystems/* go get -d github.com/RafaySystems/edge-common@main
+	$(MAKE) tidy
+
+.PHONY: push-it
+push-it:
+	docker push $(DEV_TAG)
+
+.PHONY: tag-dev
+tag-dev:
+	docker tag ${IMG} $(DEV_TAG)
+
 .PHONY: build
 build:
-	go build -o bin/karpenter-provider-rafay ./cmd/controller
+	@test -d "$(EDGE_COMMON_DIR)" || (echo "edge-common not found at $(EDGE_COMMON_DIR); set EDGE_COMMON_DIR" >&2; exit 1)
+	DOCKER_BUILDKIT=1 docker build . -t ${IMG} --pull \
+		--build-arg LDFLAGS=$(LDFLAGS) \
+		--build-arg BUILD_USR=${BUILD_USER} \
+		--build-arg BUILD_PWD=${BUILD_PASSWORD} \
+		--build-context edgecommon=$(EDGE_COMMON_DIR)
 
-# Download dependencies
+.PHONY: push
+push: build tag-dev push-it
+
+# Local compile (linux/arm64) + distroless:debug image pushed as $(DEV_TAG) — same pattern as edgesrv build-dev / push-dev.
+.PHONY: build-dev
+build-dev: check
+	rm -f karpenter-provider-rafay.big
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOPRIVATE=github.com/RafaySystems/* go build -ldflags $(LDFLAGS) -a -o karpenter-provider-rafay.big ./cmd/controller
+	docker build --platform linux/amd64 --push -f Dockerfile.dev -t ${DEV_TAG} .
+
+.PHONY: push-dev
+push-dev: build-dev push-it
+
+.PHONY: compile
+compile:
+	go build -ldflags $(LDFLAGS) -o bin/karpenter-provider-rafay ./cmd/controller
+
+.PHONY: check
+check: tidy
+	go fmt ./...
+
+.PHONY: tidy
+tidy:
+	GOPRIVATE=github.com/RafaySystems/* go mod tidy
+
+.PHONY: vendor
+vendor:
+	GOPRIVATE=github.com/RafaySystems/* go mod vendor
+
 .PHONY: deps
-deps:
-	go mod tidy
+deps: tidy
 	go mod download
 
-# Run the controller locally (uses KUBECONFIG). Set EDGE_CLIENT_CERT_FOLDER or CERT_FOLDER (edge-broker TLS).
 .PHONY: run
-run: build
+run: compile
 	./bin/karpenter-provider-rafay
 
 .PHONY: run-fast
 run-fast:
 	go run ./cmd/controller
 
-# Install CRDs then controller RBAC/Deployment (explicit files so a stray kustomization.yaml in config/deploy/ is ignored).
 .PHONY: deploy-crd
 deploy-crd:
 	kubectl apply -f config/crd/
@@ -41,44 +85,31 @@ deploy-apply:
 .PHONY: deploy
 deploy: deploy-crd deploy-apply
 
-# --- Docker (aligned with edgesrv) ---
-# "exec format error" at runtime means the image CPU arch does not match the node (e.g. arm64 image on amd64).
-# Use docker-build-amd64 for typical x86 clusters; docker-build-arm64 for ARM nodes (e.g. Graviton).
-# Default docker-build targets linux/amd64 so builds on Apple Silicon still run on common clusters.
-
 .PHONY: docker-build
-docker-build: docker-build-amd64
+docker-build: build
 
 .PHONY: docker-build-amd64
-docker-build-amd64:
-	DOCKER_BUILDKIT=1 docker build . -t $(IMG) --pull --platform linux/amd64
+docker-build-amd64: build
 
 .PHONY: docker-build-arm64
 docker-build-arm64:
-	DOCKER_BUILDKIT=1 docker build . -t $(IMG) --pull --platform linux/arm64
+	@test -d "$(EDGE_COMMON_DIR)" || (echo "edge-common not found at $(EDGE_COMMON_DIR)" >&2; exit 1)
+	DOCKER_BUILDKIT=1 docker build . -t ${IMG} --pull --platform linux/arm64 \
+		--build-arg LDFLAGS=$(LDFLAGS) \
+		--build-arg BUILD_USR=${BUILD_USER} \
+		--build-arg BUILD_PWD=${BUILD_PASSWORD} \
+		--build-context edgecommon=$(EDGE_COMMON_DIR)
 
-# Tag local IMG as DEV_TAG and push to registry.dev.rafay-edge.net
-.PHONY: push-it
-push-it:
-	docker tag $(IMG) $(DEV_TAG)
-	docker push $(DEV_TAG)
-
-# Build then push to dev registry
-.PHONY: push
-push: docker-build push-it
-
-# Install CRDs into current cluster
 .PHONY: install-crds
 install-crds:
 	kubectl apply -f config/crd/
 
-# Generate CRDs (controller-gen)
 .PHONY: generate
 generate:
 	controller-gen object:headerFile=hack/boilerplate.go.txt paths=./pkg/apis/...
 	controller-gen crd paths=./pkg/apis/... output:crd:dir=config/crd
 
-# Clean build artifacts
 .PHONY: clean
 clean:
 	rm -rf bin/
+	rm -f karpenter-provider-rafay.big
