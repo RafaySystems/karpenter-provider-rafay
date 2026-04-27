@@ -1,0 +1,51 @@
+# Default values for karpenter-provider-rafay.
+# Rafay control plane: use this chart from a Helm catalog when creating a custom add-on.
+
+replicaCount: 1
+
+image:
+  repository: karpenter-provider-rafay
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# Deployment and ServiceAccount live here (must exist; same as edge-client).
+namespace:
+  workload: rafay-system
+
+# Namespace used only for leader-election Lease objects (see deployment comments).
+leaderElection:
+  namespace: karpenter
+
+edgeBroker:
+  certFolder: /opt/rcloud/certs
+  serverPort: "443"
+  grpcInsecure: false
+  grpcPort: ""
+  grpcHost: ""
+
+optionalEnv:
+  edgeId: ""
+  streamId: ""
+  rafayClusterId: ""
+  rafayProjectId: ""
+
+secrets:
+  # TLS material volume (client.crt, client.key, ca.crt) — same pattern as edge-client.
+  edgeClientCreds: edge-client-creds
+  # Optional Secret for extra env via envFrom (set to "" to omit).
+  envFrom: karpenter-provider-rafay
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+# Extra container env (list of {name, value}); merged after defaults.
+extraEnv: []
+
+nameOverride: ""
+# Keep API object names aligned with config/deploy/*.yaml (plain kubectl apply).
+fullnameOverride: karpenter-provider-rafay

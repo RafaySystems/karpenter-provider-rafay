@@ -1,0 +1,82 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "karpenter-provider-rafay.fullname" . }}
+  namespace: {{ .Values.namespace.workload | quote }}
+  labels:
+    {{- include "karpenter-provider-rafay.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "karpenter-provider-rafay.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "karpenter-provider-rafay.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: controller
+    spec:
+      serviceAccountName: {{ include "karpenter-provider-rafay.fullname" . }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+        - name: controller
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: LEADER_ELECTION_NAMESPACE
+              value: {{ .Values.leaderElection.namespace | quote }}
+            - name: EDGE_CLIENT_CERT_FOLDER
+              value: {{ .Values.edgeBroker.certFolder | quote }}
+            - name: EDGE_CLIENT_SERVER_PORT
+              value: {{ .Values.edgeBroker.serverPort | quote }}
+            {{- if .Values.edgeBroker.grpcInsecure }}
+            - name: EDGE_BROKER_GRPC_INSECURE
+              value: "true"
+            {{- if .Values.edgeBroker.grpcPort }}
+            - name: EDGE_BROKER_GRPC_PORT
+              value: {{ .Values.edgeBroker.grpcPort | quote }}
+            {{- end }}
+            {{- if .Values.edgeBroker.grpcHost }}
+            - name: EDGE_BROKER_GRPC_HOST
+              value: {{ .Values.edgeBroker.grpcHost | quote }}
+            {{- end }}
+            {{- end }}
+            - name: EDGE_ID
+              value: {{ .Values.optionalEnv.edgeId | quote }}
+            - name: STREAM_ID
+              value: {{ .Values.optionalEnv.streamId | quote }}
+            - name: RAFAY_CLUSTER_ID
+              value: {{ .Values.optionalEnv.rafayClusterId | quote }}
+            - name: RAFAY_PROJECT_ID
+              value: {{ .Values.optionalEnv.rafayProjectId | quote }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if .Values.secrets.envFrom }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.secrets.envFrom | quote }}
+                optional: true
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: edge-certs
+              mountPath: {{ .Values.edgeBroker.certFolder | quote }}
+              readOnly: true
+      volumes:
+        - name: edge-certs
+          secret:
+            secretName: {{ .Values.secrets.edgeClientCreds | quote }}
+            items:
+              - key: client.crt
+                path: client.crt
+              - key: client.key
+                path: client.key
+              - key: ca.crt
+                path: ca.crt

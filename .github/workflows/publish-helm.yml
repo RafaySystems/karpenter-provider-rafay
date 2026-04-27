@@ -1,0 +1,71 @@
+# Publishes charts/karpenter-provider-rafay as a Helm HTTP repo on branch gh-pages
+# (same pattern as serving index.yaml + *.tgz from a static URL).
+#
+# After first run: Repo Settings → Pages → Build: Deploy from branch → gh-pages / root.
+# Helm repo URL: https://<org>.github.io/<repo>/
+#
+name: Publish Helm chart
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-helm-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.14.4
+
+      - name: Package chart
+        run: |
+          mkdir -p .chart-build
+          helm package charts/karpenter-provider-rafay --destination .chart-build
+          helm show chart .chart-build/*.tgz | head -20
+
+      - name: Fetch existing Helm repo (gh-pages)
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: helm-pages
+
+      - name: Ensure publish dir exists
+        run: mkdir -p helm-pages
+
+      - name: Merge new chart and build index.yaml
+        env:
+          # Project Pages: https://docs.github.com/en/pages/getting-started-with-github-pages/about-github-pages#types-of-github-pages-sites
+          HELM_BASE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
+        run: |
+          set -euo pipefail
+          mkdir -p helm-pages
+          cp .chart-build/*.tgz helm-pages/
+          cd helm-pages
+          if [ -f index.yaml ]; then
+            helm repo index . --url "${HELM_BASE_URL}" --merge index.yaml
+          else
+            helm repo index . --url "${HELM_BASE_URL}"
+          fi
+          echo "--- index.yaml (head) ---"
+          head -40 index.yaml
+
+      - name: Push to gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: ./helm-pages
