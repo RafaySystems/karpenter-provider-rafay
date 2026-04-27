@@ -1,0 +1,15 @@
+apiVersion: v1
+entries:
+  karpenter-provider-rafay:
+  - apiVersion: v2
+    appVersion: 0.1.0
+    created: "2026-04-27T10:15:48.01203912Z"
+    description: Helm chart for the Rafay Karpenter cloud provider (private cloud
+      / edge-broker).
+    digest: 87bacd09bf241b43f13fddc907de99b930e4855919170352aaac5622c559e25e
+    name: karpenter-provider-rafay
+    type: application
+    urls:
+    - https://RafaySystems.github.io/karpenter-provider-rafay/karpenter-provider-rafay-0.1.0.tgz
+    version: 0.1.0
+generated: "2026-04-27T10:15:48.011413112Z"
