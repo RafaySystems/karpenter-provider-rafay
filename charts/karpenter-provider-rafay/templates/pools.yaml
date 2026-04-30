@@ -1,0 +1,53 @@
+{{- if .Values.pools.enabled }}
+{{- range .Values.pools.nodeClasses }}
+---
+apiVersion: karpenter.rafay.io/v1alpha1
+kind: RafayNodeClass
+metadata:
+  name: {{ .name | quote }}
+spec:
+  {{- with $.Values.pools.clusterID }}
+  clusterID: {{ . | quote }}
+  {{- end }}
+  {{- with $.Values.pools.projectID }}
+  projectID: {{ . | quote }}
+  {{- end }}
+  instanceTypes:
+    {{- toYaml .instanceTypes | nindent 4 }}
+{{- end }}
+{{- range .Values.pools.nodePools }}
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: {{ .name | quote }}
+spec:
+  weight: {{ .weight }}
+  template:
+    metadata:
+      labels:
+        nodepool: {{ (.nodepoolLabel | default .name) | quote }}
+    spec:
+      requirements:
+        - key: kubernetes.io/os
+          operator: In
+          values: ["linux"]
+        - key: kubernetes.io/arch
+          operator: In
+          values:
+            {{- toYaml .archValues | nindent 12 }}
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values:
+            {{- toYaml .capacityTypes | nindent 12 }}
+      nodeClassRef:
+        group: karpenter.rafay.io
+        kind: RafayNodeClass
+        name: {{ .nodeClassName | quote }}
+  limits:
+    {{- toYaml .limits | nindent 4 }}
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: {{ .consolidateAfter | quote }}
+{{- end }}
+{{- end }}

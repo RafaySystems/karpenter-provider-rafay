@@ -49,3 +49,47 @@ extraEnv: []
 nameOverride: ""
 # Keep API object names aligned with config/deploy/*.yaml (plain kubectl apply).
 fullnameOverride: karpenter-provider-rafay
+
+# Optional RafayNodeClass + NodePool CRs (Path 1: enable + tune via Rafay cluster overrides on values).
+# When enabled, applies after CRDs exist (same chart / same release as the controller).
+pools:
+  enabled: false
+  # Set only if your RafayNodeClass spec still requires them; many setups use controller env instead.
+  clusterID: ""
+  projectID: ""
+  nodeClasses:
+    - name: oci-inst
+      instanceTypes:
+        - name: oci-inst
+          cpu: "8"
+          memory: "16Gi"
+          architectures: ["amd64"]
+          operatingSystems: ["linux"]
+    - name: oci-inst-arm
+      instanceTypes:
+        - name: oci-inst-arm
+          cpu: "8"
+          memory: "16Gi"
+          architectures: ["arm64"]
+          operatingSystems: ["linux"]
+  nodePools:
+    - name: worker-pool-amd
+      weight: 100
+      nodeClassName: oci-inst
+      nodepoolLabel: worker-pool-amd
+      archValues: ["amd64"]
+      capacityTypes: ["on-demand"]
+      limits:
+        cpu: "1000"
+        memory: "1000Gi"
+      consolidateAfter: 5m
+    - name: worker-pool-arm
+      weight: 100
+      nodeClassName: oci-inst-arm
+      nodepoolLabel: worker-pool-arm
+      archValues: ["arm64"]
+      capacityTypes: ["on-demand"]
+      limits:
+        cpu: "1000"
+        memory: "1000Gi"
+      consolidateAfter: 5m
