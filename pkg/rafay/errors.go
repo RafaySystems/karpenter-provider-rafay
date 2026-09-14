@@ -17,3 +17,8 @@ var ErrListNodesUnsupported = errors.New("rafay: ListNodes not implemented for t
 
 // ErrGetNodeUnsupported is returned when GetNode has no remote API; CloudProvider falls back to kube.
 var ErrGetNodeUnsupported = errors.New("rafay: GetNode not implemented for this client")
+
+// ErrBatchRejected is returned when the broker rejects a batch (e.g. its processing queue is
+// full). The stream stays alive at the broker; the caller should retry later. The rejection
+// reason is wrapped into the returned error.
+var ErrBatchRejected = errors.New("rafay: batch rejected by broker")

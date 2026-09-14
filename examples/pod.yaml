@@ -1,0 +1,37 @@
+#!/bin/bash
+
+set -euo pipefail
+
+# Validate input
+if [ "$#" -ne 1 ]; then
+  echo "Usage: $0 <pod-name>"
+  exit 1
+fi
+
+POD_NAME=$1
+
+echo "Creating pod: $POD_NAME"
+
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${POD_NAME}
+  namespace: default
+  labels:
+    app: pause-high-requests
+spec:
+  containers:
+    - name: pause
+      image: registry.k8s.io/pause:3.9
+      resources:
+        requests:
+          cpu: "4"
+          memory: "4Gi"
+        limits:
+          cpu: "4"
+          memory: "4Gi"
+  restartPolicy: Always
+EOF
+
+echo "Pod ${POD_NAME} applied successfully."

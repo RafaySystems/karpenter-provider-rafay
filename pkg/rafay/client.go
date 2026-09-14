@@ -20,20 +20,9 @@ import (
 	"context"
 )
 
-// Client adds and removes nodes via edge-broker (BrokerClient).
+// Client looks up nodes via edge-broker (BrokerClient). Node add/remove go through the
+// NodeBatcher (Enqueue/EnqueueRemove), not through this interface.
 type Client interface {
-	// AddNodes requests Rafay to add one or more nodes to the cluster.
-	// It returns the provider ID(s) of the node(s) being added (e.g. "rafay://cluster-id/node-id").
-	// The node may not be registered in the cluster immediately; the returned provider ID
-	// is used by Karpenter to track the NodeClaim until the node appears.
-	// AddNodesRequest.OperationID is required by the broker.
-	AddNodes(ctx context.Context, req AddNodesRequest) (*AddNodesResponse, error)
-
-	// RemoveNode requests Rafay to remove the node identified by providerID from the cluster.
-	// operationID is sent to the broker (required); use a stable id per delete (e.g. NodeClaim UID).
-	// Returns nil when the node is removed or already gone; returns NodeNotFound when appropriate.
-	RemoveNode(ctx context.Context, providerID, operationID string) error
-
 	// GetNode returns info for the node with the given provider ID, or nil if not found.
 	GetNode(ctx context.Context, providerID string) (*NodeInfo, error)
 
@@ -46,19 +35,24 @@ type AddNodesRequest struct {
 	ClusterID    string
 	ProjectID    string
 	InstanceType string
-	Count        int
 	// NodePoolName can be used by Rafay to target a specific node pool.
 	NodePoolName string
-	// OperationID is required: sent as KarpenterNodeStreamClientToBroker.operation_id (e.g. NodeClaim UID)
+	// OperationID is required: sent as KarpenterBatchNodeAddItem.operation_id (e.g. NodeClaim UID)
 	// for idempotent adds and broker correlation across restarts.
 	OperationID string
 }
 
-// AddNodesResponse returned after requesting node addition.
-type AddNodesResponse struct {
-	// ProviderIDs are the provider IDs of the requested nodes (e.g. rafay://cluster/node-id).
-	// For a single-node request, one element; Rafay may support adding multiple in one call.
-	ProviderIDs []string
+// RemoveNodesRequest parameters for removing a node via Rafay API. The platform's worker-node
+// catalog is declarative (per pool+SKU counts), so removal is a count decrement targeted by
+// InstanceType + NodePoolName; ProviderID is carried for future targeted removal.
+type RemoveNodesRequest struct {
+	ClusterID    string
+	ProjectID    string
+	InstanceType string
+	// NodePoolName identifies the node pool the node belongs to.
+	NodePoolName string
+	// ProviderID identifies the node to remove (e.g. rafay://cluster/node-id).
+	ProviderID string
 }
 
 // NodeInfo describes a node known to Rafay (for Get/List).

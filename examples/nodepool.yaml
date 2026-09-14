@@ -1,5 +1,15 @@
 # Example RafayNodeClass + NodePool for karpenter-provider-rafay (edge-broker only).
-# Edit clusterID / projectID to match your Rafay cluster, then:
+#
+# NOTE: with the default KARPENTER_CONFIG_BOOTSTRAP=true you do not need this file — the
+# controller fetches the cluster's pools and node SKUs from edge-broker and applies equivalent
+# objects itself (README → "Node pool bootstrap from edge-broker"). Applying this by hand on
+# such a cluster is fine but pointless: the next resync overwrites it with the broker's version.
+# This file is for clusters running with KARPENTER_CONFIG_BOOTSTRAP=false, and as a reference
+# for the shape the broker renders.
+# Same manifest can be applied to every cluster: RafayNodeClass carries no Rafay cluster/project
+# identity, so set RAFAY_CLUSTER_ID / RAFAY_PROJECT_ID on the controller Deployment (or Secret
+# envFrom) per cluster. spec.clusterID / spec.projectID no longer exist — the CRD's structural
+# schema rejects them rather than accepting and ignoring them.
 #   kubectl apply -f examples/nodepool.yaml
 #
 # Requires: CRDs applied (config/crd/) and controller running with broker TLS + EDGE_ID/STREAM_ID.
@@ -7,63 +17,108 @@
 apiVersion: karpenter.rafay.io/v1alpha1
 kind: RafayNodeClass
 metadata:
-  name: default
+  name: oci-inst
 spec:
-  clusterID: "replace-with-rafay-cluster-id"
-  projectID: "replace-with-rafay-project-id"
-  # Names must match what Rafay accepts in AddNodes; tune cpu/memory to real shapes if needed.
-  # If omitted, the provider uses the same set as built-in defaults.
+  # instanceTypes is required. Each name must match the instance type accepted by the Rafay broker.
+  # "architectures" / "operatingSystems" map to kubernetes.io/arch and kubernetes.io/os labels so
+  # NodePool requirements (e.g. arch In [amd64]) match this entry.
   instanceTypes:
-    - name: standard-2-4
-      cpu: "2"
-      memory: "4Gi"
-      zone: default
-    - name: standard-4-8
+    - name: oci-inst
       cpu: "4"
       memory: "8Gi"
-      zone: default
-    - name: standard-8-16
+      # TEMPORARY field. Uncomment ONLY for a SKU that really has accelerators — without it a pod
+      # requesting nvidia.com/gpu stays Pending ("no instance type has enough resources"), but with
+      # it on a SKU that has none, the node registers and never advertises nvidia.com/gpu, leaving
+      # its NodeClaim stuck Initialized=Unknown with nothing to reap it. The device plugin must also
+      # tolerate the pool's taints. See docs/architecture.md (RafayNodeClass CRD).
+      # nvidia.com/gpu: "8"
+      architectures: ["amd64"]
+      operatingSystems: ["linux"]
+
+---
+apiVersion: karpenter.rafay.io/v1alpha1
+kind: RafayNodeClass
+metadata:
+  name: oci-inst-arm
+spec:
+  # instanceTypes is required. Each name must match the instance type accepted by the Rafay broker.
+  # "architectures" / "operatingSystems" map to kubernetes.io/arch and kubernetes.io/os labels.
+  instanceTypes:
+    - name: oci-inst-arm
       cpu: "8"
       memory: "16Gi"
-      zone: default
-    - name: standard-16-32
-      cpu: "16"
-      memory: "32Gi"
-      zone: default
-    - name: standard-32-64
-      cpu: "32"
-      memory: "64Gi"
-      zone: default
-    - name: standard-48-96
-      cpu: "48"
-      memory: "96Gi"
-      zone: default
+      architectures: ["arm64"]
+      operatingSystems: ["linux"]
+
 ---
 apiVersion: karpenter.sh/v1
 kind: NodePool
 metadata:
-  name: default
+  name: worker-pool-amd
 spec:
   weight: 100
   template:
     metadata:
       labels:
-        nodepool: default
+        nodepool: worker-pool-amd
     spec:
       requirements:
+        - key: kubernetes.io/os
+          operator: In
+          values: ["linux"]
         - key: kubernetes.io/arch
           operator: In
-          values: ["amd64", "arm64"]
+          values: ["amd64"]
         - key: karpenter.sh/capacity-type
           operator: In
           values: ["on-demand"]
       nodeClassRef:
         group: karpenter.rafay.io
         kind: RafayNodeClass
-        name: default
+        name: oci-inst
+  limits:
+    cpu: "1000"
+    nvidia.com/gpu: "16"
+    amd.com/gpu: "16"
+    memory: 1000Gi
+  disruption:
+    # Headroom requires WhenEmpty: pause pods keep buffer nodes non-empty, so
+    # WhenEmptyOrUnderutilized would consolidate headroom nodes away right after they
+    # are provisioned and the replacement pause pods would scale them back up — an
+    # endless provision/consolidate oscillation. WhenEmpty only reclaims a node once
+    # every pod (including headroom pods) has left it.
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 5m
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: worker-pool-arm
+spec:
+  weight: 100
+  template:
+    metadata:
+      labels:
+        nodepool: worker-pool-arm
+    spec:
+      requirements:
+        - key: kubernetes.io/os
+          operator: In
+          values: ["linux"]
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["arm64"]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand"]
+      nodeClassRef:
+        group: karpenter.rafay.io
+        kind: RafayNodeClass
+        name: oci-inst-arm
   limits:
     cpu: "1000"
     memory: 1000Gi
   disruption:
-    consolidationPolicy: WhenEmptyOrUnderutilized
+    # Headroom requires WhenEmpty (see worker-pool-amd above for the full rationale).
+    consolidationPolicy: WhenEmpty
     consolidateAfter: 5m

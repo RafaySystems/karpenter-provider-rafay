@@ -62,10 +62,40 @@ spec:
             # Optional: gRPC sessionid (auto-generated UUID per controller start like edge-client NewID(); match edge-client log "using session" if broker requires it).
             - name: STREAM_ID
               value: ""
-            - name: RAFAY_CLUSTER_ID
-              value: ""
-            - name: RAFAY_PROJECT_ID
-              value: ""
+            # RAFAY_CLUSTER_ID / RAFAY_PROJECT_ID are deliberately NOT declared inline. An inline
+            # env entry wins over envFrom, so `value: ""` here would shadow the karpenter-provider-rafay
+            # Secret below and make secret.example.yaml unable to set them. Supply them via that
+            # Secret, or add them here with a real value — not both.
+            #
+            # Both are optional in practice: edge-broker identifies the cluster from the mTLS client
+            # certificate (Subject O), not from these values, and derives the project itself. They are
+            # carried on add/remove payloads and used for the fallback providerID string, so an unset
+            # RAFAY_CLUSTER_ID degrades that string rather than failing provisioning.
+            # Karpenter provisioner batch window: how long to wait for more unschedulable pods before
+            # running the scheduling simulation. Increase if pods become unschedulable slowly (e.g. large
+            # deployments where the scheduler marks pods one at a time).
+            - name: BATCH_IDLE_DURATION
+              value: "5s"
+            - name: BATCH_MAX_DURATION
+              value: "30s"
+            # On startup (and every KARPENTER_CONFIG_SYNC_INTERVAL) the controller fetches this
+            # cluster's node pools and node SKUs from edge-broker and applies them as
+            # RafayNodeClass + NodePool, so no hand-written manifests are needed. Objects it
+            # applies carry karpenter.rafay.io/managed-by=edge-broker.
+            # Set to "false" if this cluster's NodePools are managed by hand or by GitOps —
+            # otherwise the resync overwrites whatever that owner writes.
+            - name: KARPENTER_CONFIG_BOOTSTRAP
+              value: "true"
+            - name: KARPENTER_CONFIG_SYNC_INTERVAL
+              value: "10m"
+            # A cluster is created with the worker nodes its catalog asks for, before Karpenter
+            # runs. Those nodes have no NodeClaim, and Karpenter counts only NodeClaims — so it
+            # would provision its full limits on top of them and could never consolidate them.
+            # With this on, each such node gets a NodeClaim (no node is provisioned to do it).
+            # Set to "false" to leave pre-existing nodes outside Karpenter's control: adopted
+            # nodes become eligible for consolidation once empty.
+            - name: KARPENTER_ADOPT_EXISTING_NODES
+              value: "true"
             # CERT_FOLDER overrides EDGE_CLIENT_CERT_FOLDER; SERVER_PORT overrides EDGE_CLIENT_SERVER_PORT.
           envFrom:
             - secretRef:

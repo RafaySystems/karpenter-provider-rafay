@@ -28,6 +28,10 @@ import (
 
 	"github.com/RafaySystems/karpenter-provider-rafay/pkg/broker"
 	"github.com/RafaySystems/karpenter-provider-rafay/pkg/cloudprovider"
+	headroomctrl "github.com/RafaySystems/karpenter-provider-rafay/pkg/controllers/headroom"
+	nodeadoptionctrl "github.com/RafaySystems/karpenter-provider-rafay/pkg/controllers/nodeadoption"
+	nodeconfigctrl "github.com/RafaySystems/karpenter-provider-rafay/pkg/controllers/nodeconfig"
+	nodeprovideridctrl "github.com/RafaySystems/karpenter-provider-rafay/pkg/controllers/nodeproviderid"
 	rafaynodeclassctrl "github.com/RafaySystems/karpenter-provider-rafay/pkg/controllers/rafaynodeclass"
 	"github.com/RafaySystems/karpenter-provider-rafay/pkg/rafay"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/metrics"
@@ -38,11 +42,32 @@ import (
 
 const defaultEdgeClientServerPort = 5448
 
+// envPortOrDefault parses the named environment variable as a port number. Unset returns def;
+// an invalid value logs a warning and keeps the default (instead of silently ignoring it).
+func envPortOrDefault(name string, def int) int {
+	p := strings.TrimSpace(os.Getenv(name))
+	if p == "" {
+		return def
+	}
+	v, err := strconv.Atoi(p)
+	if err != nil {
+		klog.Warningf("invalid %s=%q, using default %d", name, p, def)
+		return def
+	}
+	return v
+}
+
 func main() {
 	ctx, op := coreoperator.NewOperator()
 
 	clusterID := os.Getenv("RAFAY_CLUSTER_ID")
 	projectID := os.Getenv("RAFAY_PROJECT_ID")
+	if clusterID == "" {
+		klog.Warning("RAFAY_CLUSTER_ID is not set; node provisioning will fail — set RAFAY_CLUSTER_ID on the controller (RafayNodeClass has no per-class override)")
+	}
+	if projectID == "" {
+		klog.Warning("RAFAY_PROJECT_ID is not set; node provisioning may fail — set RAFAY_PROJECT_ID on the controller (RafayNodeClass has no per-class override)")
+	}
 
 	certFolder := strings.TrimSpace(os.Getenv("CERT_FOLDER"))
 	if certFolder == "" {
@@ -72,21 +97,13 @@ func main() {
 
 	port := 0
 	if grpcInsecure {
-		if p := strings.TrimSpace(os.Getenv("EDGE_BROKER_GRPC_PORT")); p != "" {
-			if v, err := strconv.Atoi(p); err == nil {
-				port = v
-			}
-		}
+		port = envPortOrDefault("EDGE_BROKER_GRPC_PORT", 0)
 	} else {
 		port = defaultEdgeClientServerPort
-		if p := strings.TrimSpace(os.Getenv("SERVER_PORT")); p != "" {
-			if v, err := strconv.Atoi(p); err == nil {
-				port = v
-			}
-		} else if p := strings.TrimSpace(os.Getenv("EDGE_CLIENT_SERVER_PORT")); p != "" {
-			if v, err := strconv.Atoi(p); err == nil {
-				port = v
-			}
+		if strings.TrimSpace(os.Getenv("SERVER_PORT")) != "" {
+			port = envPortOrDefault("SERVER_PORT", defaultEdgeClientServerPort)
+		} else if strings.TrimSpace(os.Getenv("EDGE_CLIENT_SERVER_PORT")) != "" {
+			port = envPortOrDefault("EDGE_CLIENT_SERVER_PORT", defaultEdgeClientServerPort)
 		}
 	}
 
@@ -94,7 +111,7 @@ func main() {
 	// - Broker host: client.crt OU (dial) — already handled in broker dial.
 	// - Port: EDGE_CLIENT_SERVER_PORT / SERVER_PORT — above.
 	// - Session id: edge-client uses common.NewID() (UUID v4) per process; optional STREAM_ID override.
-	// - Edge id to broker: TLS client cert Subject Organization (O), not from env — optional EDGE_ID for logging only.
+	// - Edge id for logging: first DNS label of TLS client cert Subject O (same as strings.Split(O,".")[0]); optional EDGE_ID override (normalized the same way).
 	edgeID := strings.TrimSpace(os.Getenv("EDGE_ID"))
 	streamID := strings.TrimSpace(os.Getenv("STREAM_ID"))
 	if streamID == "" {
@@ -102,22 +119,36 @@ func main() {
 		klog.Infof("STREAM_ID unset; generated session id %s (edge-client uses common.NewID() per run). If the broker must match edge-client’s stream, set STREAM_ID to the id from edge-client logs (\"using session\")", streamID)
 	}
 	if !grpcInsecure && certPath != "" {
-		certO, err := broker.GetEdgeIDFromClientCert(certPath)
+		certHash, err := broker.GetEdgeIDFromClientCert(certPath)
 		if err != nil {
 			klog.Exitf("edge-broker reads client id from TLS cert Subject Organization (O): %v", err)
 		}
 		if edgeID == "" {
-			edgeID = certO
-		} else if edgeID != certO {
-			klog.Warningf("EDGE_ID=%q differs from client.crt Organization (O)=%q; the broker uses O from the mTLS certificate", edgeID, certO)
+			edgeID = certHash
+		} else {
+			envHash := broker.EdgeHashIDFromOrganization(edgeID)
+			if envHash == "" {
+				klog.Warningf("EDGE_ID=%q normalizes to empty edge hash; using cert hash %q", edgeID, certHash)
+				edgeID = certHash
+			} else {
+				if envHash != certHash {
+					klog.Warningf("EDGE_ID=%q (hash %q) differs from client.crt O hash %q; the broker uses the full O from the mTLS peer certificate", edgeID, envHash, certHash)
+				}
+				edgeID = envHash
+			}
 		}
 	}
 	if grpcInsecure {
 		klog.Warning("EDGE_BROKER_GRPC_INSECURE=true: edge-broker typically requires mTLS so it can read the client certificate (NO CLIENT ID if the peer cert is missing)")
 	}
 	rafayClient := rafay.NewBrokerClient(certPath, keyPath, caPath, port, edgeID, streamID, dialHost, grpcInsecure)
+	// FAILED add operations delete the matching pending NodeClaim so Karpenter reprovisions
+	// immediately; must be registered before the batcher starts polling.
+	rafayClient.Batcher().SetFailureHandler(cloudprovider.NewBatchFailureHandler(op.GetClient(), op.Manager.GetAPIReader()))
+	// Start the batch sender + status poller goroutines; they run until ctx is cancelled.
+	rafayClient.StartBatcher(ctx)
 
-	cp := cloudprovider.NewCloudProvider(op.GetClient(), rafayClient, clusterID, projectID)
+	cp := cloudprovider.NewCloudProvider(op.GetClient(), op.Manager.GetAPIReader(), rafayClient, clusterID, projectID, rafayClient.Batcher())
 	cloudProvider := metrics.Decorate(cp)
 	clusterState := state.NewCluster(op.Clock, op.GetClient(), cloudProvider)
 
@@ -132,8 +163,37 @@ func main() {
 		clusterState,
 		op.InstanceTypeStore,
 	)
-	allCtrls := make([]controller.Controller, 0, 1+len(coreCtrls))
+	// Headroom pods run in HEADROOM_NAMESPACE; the policy ConfigMap is read from
+	// HEADROOM_CONFIG_NAMESPACE (defaults to the pod namespace).
+	headroomNamespace := strings.TrimSpace(os.Getenv("HEADROOM_NAMESPACE"))
+	if headroomNamespace == "" {
+		headroomNamespace = "karpenter"
+	}
+	headroomConfigNamespace := strings.TrimSpace(os.Getenv("HEADROOM_CONFIG_NAMESPACE"))
+	if headroomConfigNamespace == "" {
+		headroomConfigNamespace = headroomNamespace
+	}
+
+	allCtrls := make([]controller.Controller, 0, 5+len(coreCtrls))
 	allCtrls = append(allCtrls, rafaynodeclassctrl.NewController(op.GetClient()))
+	allCtrls = append(allCtrls, nodeprovideridctrl.NewController(op.GetClient()))
+	allCtrls = append(allCtrls, headroomctrl.NewController(headroomNamespace, headroomConfigNamespace))
+	// Give the worker nodes the platform created before Karpenter ran a NodeClaim each, so a pool's
+	// existing nodes count towards its limits and can be consolidated — without them Karpenter only
+	// ever manages the nodes it added itself.
+	if nodeadoptionctrl.EnabledFromEnv() {
+		allCtrls = append(allCtrls, nodeadoptionctrl.NewController(op.GetClient(), cp))
+	} else {
+		klog.Info("KARPENTER_ADOPT_EXISTING_NODES=false: not creating NodeClaims for pre-existing worker nodes; Karpenter will not account for or consolidate them")
+	}
+	// Pull this cluster's node pools and node SKUs from edge-broker and apply them as
+	// RafayNodeClass + NodePool, so a cluster does not need hand-written manifests that
+	// duplicate (and drift from) the platform's worker-node catalog.
+	if nodeconfigctrl.EnabledFromEnv() {
+		allCtrls = append(allCtrls, nodeconfigctrl.NewController(rafayClient, clusterID, projectID, nodeconfigctrl.SyncIntervalFromEnv()))
+	} else {
+		klog.Info("KARPENTER_CONFIG_BOOTSTRAP=false: not syncing RafayNodeClass/NodePool from edge-broker; apply them yourself")
+	}
 	allCtrls = append(allCtrls, coreCtrls...)
 
 	op.WithControllers(ctx, allCtrls...).Start(ctx)

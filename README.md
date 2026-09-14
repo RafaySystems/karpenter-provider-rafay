@@ -31,10 +31,13 @@ All traffic uses **edge-broker** (no HTTP API mode).
 | `EDGE_BROKER_GRPC_INSECURE` | If unset or **`false`**, use **secured** gRPC only (same as edge-client). Set **`true`** only for a plaintext broker listener (e.g. rcloud internal **5449**). |
 | `EDGE_BROKER_GRPC_PORT` | Port when **`EDGE_BROKER_GRPC_INSECURE=true`** (default **5449** if unset). |
 | `EDGE_BROKER_GRPC_HOST` | Optional gRPC host override when using insecure or TLS; if unset, host comes from **client.crt** OU. |
-| `EDGE_ID` | Optional. Broker uses **client.crt** `Subject Organization (O)` for identity (same as edge-client). If set, should match `O`; used for logging. |
+| `EDGE_ID` | Optional. For logs we use the **first DNS label** of `Subject Organization (O)` (`strings.Split(O, ".")[0]`, same as edge hash id). If set, it is normalized the same way and should match that label; the broker still reads the **full** `O` from the mTLS peer cert. |
 | `STREAM_ID` | Optional. gRPC metadata **`sessionid`**. **Unset:** a UUID v4 is generated at startup (same pattern as edge-client `common.NewID()`). **Set** to the value from edge-client logs (`using session`) if your broker requires the same stream id as the running edge-client. |
-| `RAFAY_CLUSTER_ID` | Cluster id for add-node payloads (optional on NodeClass override) |
+| `RAFAY_CLUSTER_ID` | Cluster id stamped on add/remove-node payloads. The only source — `RafayNodeClass` has no per-class override. |
 | `RAFAY_PROJECT_ID` | Project id when required (optional) |
+| `KARPENTER_CONFIG_BOOTSTRAP` | Default **`true`**: fetch this cluster's `RafayNodeClass` / `NodePool` objects from edge-broker and apply them (see [Node pool bootstrap](#node-pool-bootstrap-from-edge-broker)). Set **`false`** when the objects are managed by hand or by GitOps. |
+| `KARPENTER_CONFIG_SYNC_INTERVAL` | How often to re-fetch that config after the first success (Go duration, default **`10m`**). |
+| `KARPENTER_ADOPT_EXISTING_NODES` | Default **`true`**: create a `NodeClaim` for each worker node the platform built before Karpenter ran, so a pool's existing nodes count towards its limits and can be consolidated (see [Adopting the cluster's existing worker nodes](#5-adopting-the-clusters-existing-worker-nodes)). Set **`false`** to leave them outside Karpenter's control. |
 
 For a local run, **`./scripts/run-local.sh`** expects `EDGE_CLIENT_CERT_FOLDER` (or `CERT_FOLDER`) to be set; it sets defaults for `RAFAY_CLUSTER_ID` and broker port only.
 
@@ -64,18 +67,82 @@ go run ./cmd/controller
 
 The controller uses your current `KUBECONFIG` to talk to the cluster. For a single-node local cluster you may need to disable leader election (see Karpenter docs for the appropriate flag or env).
 
-### 4. Create a RafayNodeClass and NodePool
+### 4. Node pool bootstrap from edge-broker
 
-After the controller is running, create a `RafayNodeClass` and a Karpenter `NodePool` that references it. See **`examples/nodepool.yaml`** or:
+**You normally do not have to write `RafayNodeClass` / `NodePool` manifests at all.**
+
+On startup the controller calls **`rep.edge.v1.KarpenterConfigService.GetKarpenterConfig`** on edge-broker. The broker reads the cluster's workspace compute instance — the same **"Worker Node Pool"** catalog that scale-out and scale-in mutate — plus the `ComputeProfile` behind each node SKU, and returns ready-to-apply manifests:
+
+| PaaS | Kubernetes |
+|------|------------|
+| catalog row `poolname` | `NodePool.metadata.name` |
+| catalog row `skuname` | `RafayNodeClass.metadata.name` and `spec.instanceTypes[0].name` |
+| catalog row `labels` / `annotations` / `taints` | `NodePool.spec.template` metadata and taints |
+| `ComputeProfile` `ocpus` / `memory_in_gbs` / `shape` | instance type `cpu` / `memory` / `architectures` |
+
+The controller server-side-applies them (node classes first), labels each object **`karpenter.rafay.io/managed-by=edge-broker`**, records the broker's config revision in **`karpenter.rafay.io/config-revision`**, and re-syncs every `KARPENTER_CONFIG_SYNC_INTERVAL` so a pool added or resized in the catalog reaches the cluster without a restart.
+
+```bash
+kubectl get nodepools,rafaynodeclasses -l karpenter.rafay.io/managed-by=edge-broker
+```
+
+Behavior worth knowing:
+
+- **Pool names are a contract.** `NodePool.metadata.name` must equal the catalog `poolname`, because the provider sends the `karpenter.sh/nodepool` label as `node_pool_name` when it asks the broker to scale. Renaming a generated NodePool breaks scale-out.
+- **Autoscaling toggle is honoured.** If the compute instance has **Auto Scaling** set to `false`, the controller logs it and applies nothing. Objects already applied are left in place.
+- **Nothing is ever pruned.** A pool that disappears from the broker's response is logged, not deleted — the broker also drops a pool when its node SKU cannot be read, and deleting a `NodePool` drains every node under it. Removing a pool stays a deliberate operator action.
+- **Applies are forced.** Server-side apply runs with `force: true`, so a field previously owned by a hand-run `kubectl apply` is taken over rather than wedging every resync on a conflict. Use `KARPENTER_CONFIG_BOOTSTRAP=false` on clusters where the broker should not be the owner.
+- **Warnings are surfaced.** A SKU whose `ComputeProfile` cannot be read makes the broker drop just that pool and return a warning, which the controller logs on every sync.
+
+### 5. Adopting the cluster's existing worker nodes
+
+**A pool's nodes usually exist before Karpenter does.** The cluster is created with the node count from its "Worker Node Pool" catalog — `pool1` has 3 nodes — and those nodes carry the pool's identity as labels (`nodepoolname=pool1`, `sku_name=oci-inst`) but no `NodeClaim`. Karpenter only counts NodeClaims, so without help it would see an **empty** pool: it would provision up to the pool's full `limits` on top of the 3 nodes already running, and it could never consolidate them (`ValidateNodeDisruptable` rejects a node with no NodeClaim: *"node isn't managed by karpenter"*).
+
+So when a `NodePool` appears — from the bootstrap above or applied by hand — the controller counts the pool's nodes, works out which of them no NodeClaim owns, and creates one per node:
+
+```bash
+$ kubectl logs -n rafay-system deploy/karpenter-provider-rafay | grep nodeadoption
+nodeadoption: prepared node test-auto-2-e-e949w9-w0-af1cc for adoption (providerID=rafay://pool1/oci-inst/test-auto-2-e-e949w9-w0-af1cc)
+nodeadoption: adopted node test-auto-2-e-e949w9-w0-af1cc into pool "pool1" as nodeclaim pool1-x4k2p (providerID=rafay://pool1/oci-inst/test-auto-2-e-e949w9-w0-af1cc, instanceType=oci-inst)
+nodeadoption: pool "pool1" has 3 node(s) in the cluster and 0 nodeclaim(s) (3 worker node(s) across all pools); adopted 3, skipped 0
+
+$ kubectl get nodeclaims -L karpenter.sh/nodepool
+NAME           TYPE       NODE                             READY   AGE   NODEPOOL
+pool1-x4k2p    oci-inst   test-auto-2-e-e949w9-w0-af1cc    True    30s   pool1
+```
+
+Each node is tied to its NodeClaim by **`spec.providerID`**, which the controller fills in when the platform left it empty, using the format the platform itself writes:
+
+```yaml
+spec:
+  providerID: rafay://pool1/oci-inst/test-auto-2-e-e949w9-w0-af1cc
+#              rafay://<nodepoolname>/<sku_name>/<hostname>
+```
+
+Behaviour worth knowing:
+
+- **No node is provisioned by adoption.** The NodeClaim is annotated `karpenter.rafay.io/adopted-provider-id`, and `CloudProvider.Create()` treats that as "this machine is already running" — it returns the annotated ProviderID without calling edge-broker. Nothing is added to the catalog and `noOfSku` does not change.
+- **Adopted nodes become disruptable.** That is the point — the pool becomes Karpenter's to size — but it means a pre-existing node that goes empty can be consolidated away after `consolidateAfter`. Set **`KARPENTER_ADOPT_EXISTING_NODES=false`** on clusters where the original nodes must stay untouched.
+- **Running pods are not disturbed.** The pool's taints are **not** copied onto adopted NodeClaims (Karpenter syncs a NodeClaim's taints onto its node, and a `NoExecute` taint would evict the pods already there), and topology labels are read from the node rather than inferred from the SKU, so real zone information is never overwritten.
+- **Only `Ready` nodes are adopted.** A node whose kubelet has not reported `Ready` is left completely untouched — no `providerID`, no NodeClaim — and picked up within seconds of becoming Ready. Adopting one early would charge the pool's limits for capacity nothing can schedule on, and a node that never comes up would leave a NodeClaim that nothing reaps for 720h. A node that goes `NotReady` *after* adoption keeps its NodeClaim, and is not counted as waiting. The log line says how many genuinely are:
+
+  ```
+  nodeadoption: pool "pool1" has 3 node(s) in the cluster and 2 nodeclaim(s) (3 worker node(s) across all pools); adopted 2, skipped 0, waiting for 1 node(s) to become Ready
+  ```
+- **A node Karpenter is still waiting for is left alone.** If a scale-out has an unresolved NodeClaim that this node could satisfy, adoption skips it and lets the ProviderID resolution path bind the two.
+- **Mismatches are reported, not forced.** A node whose `sku_name` is not in the pool's `RafayNodeClass`, or whose labels do not satisfy the pool's requirements (an arm64 node in an amd64 pool), is logged as a warning and left unmanaged — a NodeClaim for it would be read as drifted and the node drained.
+- **Control-plane nodes are never adopted**, even if they carry a `nodepoolname` label.
+
+### 6. Writing the manifests yourself (optional)
+
+With `KARPENTER_CONFIG_BOOTSTRAP=false`, create a `RafayNodeClass` and a Karpenter `NodePool` that references it. Set **`RAFAY_CLUSTER_ID`** / **`RAFAY_PROJECT_ID`** on the controller per cluster (not in the CR) so the same YAML can be reused everywhere. See **`examples/nodepool.yaml`** or:
 
 ```yaml
 apiVersion: karpenter.rafay.io/v1alpha1
 kind: RafayNodeClass
 metadata:
   name: default
-spec:
-  clusterID: "my-cluster"
-  projectID: "my-project"
+spec: {}
 ---
 apiVersion: karpenter.sh/v1
 kind: NodePool

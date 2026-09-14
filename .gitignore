@@ -5,3 +5,5 @@
 .vscode/
 *.test
 coverage.out
+*.big
+.claude/worktrees/

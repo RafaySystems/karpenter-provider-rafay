@@ -1,6 +1,19 @@
 # RafayNodeClass CRD for Karpenter provider (private cloud).
 # Karpenter core CRDs (NodeClaim, NodePool) live in this directory as karpenter.sh_*.yaml (match go.mod / Karpenter tag).
 # Apply all: kubectl apply -f config/crd/
+#
+# spec is a STRUCTURAL schema (no x-kubernetes-preserve-unknown-fields): it lists exactly the
+# fields RafayNodeClassSpec declares, so anything else is rejected by `kubectl apply` (which
+# defaults to strict field validation) and pruned for clients that ask for lenient validation.
+# This is what keeps the removed spec.clusterID / spec.projectID from silently reappearing —
+# a per-NodeClass identity override no longer exists; the controller reads RAFAY_CLUSTER_ID /
+# RAFAY_PROJECT_ID from its own environment. Keep this schema in step with
+# pkg/apis/v1alpha1/rafaynodeclass.go: a field present in Go but missing here is pruned away
+# before the controller ever sees it.
+#
+# status stays permissive on purpose — conditions are written by the readiness controller via
+# operatorpkg (metav1.Condition), and pruning a status field the controller depends on would
+# break readiness rather than catch a user error.
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
@@ -24,8 +37,64 @@ spec:
         status: {}
       schema:
         openAPIV3Schema:
+          description: RafayNodeClass is a cluster-agnostic catalog of instance types available for provisioning via edge-broker.
           type: object
-          x-kubernetes-preserve-unknown-fields: true
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              description: >-
+                Node shapes available for provisioning. instanceTypes is the only field: the
+                Rafay cluster/project identity comes from the controller's RAFAY_CLUSTER_ID /
+                RAFAY_PROJECT_ID environment, never from this object.
+              type: object
+              properties:
+                instanceTypes:
+                  description: >-
+                    Node shapes available for provisioning. At least one entry is required in
+                    practice — the readiness controller sets Ready=False (ValidationFailed) on an
+                    empty list, and GetInstanceTypes errors.
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      name:
+                        description: Must match node.kubernetes.io/instance-type (e.g. standard-4-8).
+                        type: string
+                      cpu:
+                        description: CPU capacity as a quantity string (e.g. "4", "8000m"). Quote plain numbers.
+                        type: string
+                      memory:
+                        description: Memory capacity as a quantity string (e.g. "8Gi").
+                        type: string
+                      nvidia.com/gpu:
+                        description: >-
+                          TEMPORARY. Accelerator capacity as a quantity string (e.g. "8"). Omit for
+                          SKUs with no GPU: a node that never advertises nvidia.com/gpu in its
+                          allocatable leaves its NodeClaim stuck Initialized=Unknown, and nothing
+                          reaps it. Removed once instanceTypes carry the real per-SKU resource name.
+                        type: string
+                      zone:
+                        description: Zone for this offering (e.g. zone-a). Used for topology.kubernetes.io/zone.
+                        type: string
+                      architectures:
+                        description: CPU architectures this SKU supports (kubernetes.io/arch), e.g. ["amd64"].
+                        type: array
+                        items:
+                          type: string
+                      operatingSystems:
+                        description: OS values this SKU supports (kubernetes.io/os), e.g. ["linux"].
+                        type: array
+                        items:
+                          type: string
+            status:
+              description: Readiness and health signals, written by the RafayNodeClass controller.
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
       additionalPrinterColumns:
         - name: Age
           type: date

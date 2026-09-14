@@ -33,19 +33,30 @@ import (
 	"k8s.io/klog/v2"
 )
 
+// Ensure BrokerClient satisfies the compile-time check that StartBatcher is present.
+var _ interface{ StartBatcher(context.Context) } = (*BrokerClient)(nil)
+
 const (
 	// gRPC metadata key for stream routing (edge-common/pkg/common.SessionID).
 	grpcMetadataSessionID = "sessionid"
 
-	pollTimeout = 60 * time.Minute
+	// brokerCallTimeout bounds each individual broker RPC (send batch, status poll, cancel).
+	// These calls are short request/response exchanges; long-running work is tracked via
+	// status polling, so no call should outlive this deadline.
+	brokerCallTimeout = 30 * time.Second
+
+	// karpenterConfigCallTimeout bounds GetKarpenterConfig. It is more generous than
+	// brokerCallTimeout because the broker fans out to PaaS for one compute-instance read plus
+	// one compute-profile read per distinct node SKU, all on the caller's clock.
+	karpenterConfigCallTimeout = 90 * time.Second
 
 	defaultEdgeClientTLSPort = 5448
 	defaultEdgeBrokerRPCPort = 5449
 )
 
 // BrokerClient talks to edge-broker over the same TLS/insecure dial as before; node add/remove use
-// rep.edge.v1.KarpenterNodeService.StreamOperations (not EdgeCommandService).
-// It keeps one long-lived *grpc.ClientConn; each add/remove opens a dedicated bidi stream on that connection.
+// rep.edge.v1.KarpenterBatchService.BatchStreamOperations (not EdgeCommandService).
+// It keeps one long-lived *grpc.ClientConn; each call opens a short-lived bidi stream on that connection.
 type BrokerClient struct {
 	CertPath     string
 	KeyPath      string
@@ -56,14 +67,15 @@ type BrokerClient struct {
 	DialHost     string
 	GRPCInsecure bool
 
-	mu   sync.Mutex
-	conn *grpc.ClientConn
+	mu      sync.Mutex
+	conn    *grpc.ClientConn
+	batcher *NodeBatcher
 }
 
 // NewBrokerClient creates a client. StreamID is gRPC metadata sessionid (edge-client: common.NewID()).
 // EdgeID is informational; the broker takes edge id from the TLS client cert Subject O.
 func NewBrokerClient(certPath, keyPath, caPath string, brokerPort int, edgeID, streamID, dialHost string, grpcInsecure bool) *BrokerClient {
-	return &BrokerClient{
+	c := &BrokerClient{
 		CertPath:     certPath,
 		KeyPath:      keyPath,
 		CAPath:       caPath,
@@ -73,6 +85,19 @@ func NewBrokerClient(certPath, keyPath, caPath string, brokerPort int, edgeID, s
 		DialHost:     dialHost,
 		GRPCInsecure: grpcInsecure,
 	}
+	c.batcher = NewNodeBatcher(c)
+	return c
+}
+
+// StartBatcher launches the NodeBatcher goroutines (sender + poller). Call once from main after
+// the BrokerClient is created; the batcher runs until ctx is cancelled.
+func (c *BrokerClient) StartBatcher(ctx context.Context) {
+	go c.batcher.Run(ctx)
+}
+
+// Batcher returns the NodeBatcher used by this client.
+func (c *BrokerClient) Batcher() *NodeBatcher {
+	return c.batcher
 }
 
 // dialBroker creates a new gRPC connection: TLS (edge-client–compatible) unless GRPCInsecure.
@@ -175,72 +200,27 @@ func (c *BrokerClient) callBroker(ctx context.Context, fn func(cc *grpc.ClientCo
 	return err
 }
 
+// callBrokerOnce calls fn with a connection but does not retry. Use for streaming operations
+// that must not be re-issued (e.g. SendBatch, SendBatchRemove) since retrying could duplicate work.
+// On Unavailable the connection is closed so the next call gets a fresh one.
+func (c *BrokerClient) callBrokerOnce(ctx context.Context, fn func(cc *grpc.ClientConn) error) error {
+	cc, err := c.getConn(ctx)
+	if err != nil {
+		return err
+	}
+	err = fn(cc)
+	if err != nil && shouldRedial(err) {
+		c.closeConn()
+	}
+	return err
+}
+
 func (c *BrokerClient) streamContext(ctx context.Context) context.Context {
 	sid := strings.TrimSpace(c.StreamID)
 	if sid == "" {
 		return ctx
 	}
 	return metadata.AppendToOutgoingContext(ctx, grpcMetadataSessionID, sid)
-}
-
-// AddNodes uses KarpenterNodeService.StreamOperations: node_add then status polls until provider IDs are returned.
-func (c *BrokerClient) AddNodes(ctx context.Context, req AddNodesRequest) (*AddNodesResponse, error) {
-	klog.Info("AddNodes", "pollTimeout", pollTimeout, "streamID", c.StreamID, "operationID", req.OperationID, "instanceType", req.InstanceType, "nodePool", req.NodePoolName, "clusterID", req.ClusterID, "projectID", req.ProjectID)
-	if strings.TrimSpace(c.StreamID) == "" {
-		return nil, fmt.Errorf("STREAM_ID is required (gRPC metadata sessionid for edge-broker)")
-	}
-	var out *AddNodesResponse
-	err := c.callBroker(ctx, func(cc *grpc.ClientConn) error {
-		pollCtx, cancel := context.WithTimeout(c.streamContext(ctx), pollTimeout)
-		defer cancel()
-		addReq := &v1.KarpenterNodeAddRequest{
-			ClusterId:    req.ClusterID,
-			ProjectId:    req.ProjectID,
-			InstanceType: req.InstanceType,
-			NodePoolName: req.NodePoolName,
-		}
-		if strings.TrimSpace(req.OperationID) == "" {
-			return fmt.Errorf("OperationID is required for Karpenter node add (broker requires operation_id)")
-		}
-		klog.Infof("edge-broker: KarpenterNode add stream instanceType=%q nodePool=%q operationID=%q", req.InstanceType, req.NodePoolName, req.OperationID)
-		ids, err := streamKarpenterNodeAdd(pollCtx, cc, strings.TrimSpace(c.StreamID), strings.TrimSpace(req.OperationID), addReq)
-		if err != nil {
-			klog.Errorf("edge-broker: KarpenterNode add stream failed: %v", err)
-			return err
-		}
-		if len(ids) == 0 {
-			return fmt.Errorf("broker add node: no provider IDs in response")
-		}
-		out = &AddNodesResponse{ProviderIDs: ids}
-		klog.Infof("edge-broker: KarpenterNode add ok providerIDs=%v", ids)
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-// RemoveNode uses KarpenterNodeService.StreamOperations: node_delete then status polls until success.
-func (c *BrokerClient) RemoveNode(ctx context.Context, providerID, operationID string) error {
-	if strings.TrimSpace(c.StreamID) == "" {
-		return fmt.Errorf("STREAM_ID is required (gRPC metadata sessionid for edge-broker)")
-	}
-	if strings.TrimSpace(operationID) == "" {
-		return fmt.Errorf("operationID is required for Karpenter node delete (broker requires operation_id)")
-	}
-	return c.callBroker(ctx, func(cc *grpc.ClientConn) error {
-		pollCtx, cancel := context.WithTimeout(c.streamContext(ctx), pollTimeout)
-		defer cancel()
-		delReq := &v1.KarpenterNodeDeleteRequest{ProviderId: providerID}
-		klog.Infof("edge-broker: KarpenterNode delete stream providerID=%q operationID=%q", providerID, operationID)
-		if err := streamKarpenterNodeDelete(pollCtx, cc, strings.TrimSpace(c.StreamID), strings.TrimSpace(operationID), delReq); err != nil {
-			klog.Errorf("edge-broker: KarpenterNode delete stream failed: %v", err)
-			return err
-		}
-		klog.Infof("edge-broker: KarpenterNode delete ok providerID=%q", providerID)
-		return nil
-	})
 }
 
 // GetNode is not implemented via broker; CloudProvider falls back to the Kubernetes API.
@@ -251,4 +231,114 @@ func (c *BrokerClient) GetNode(ctx context.Context, providerID string) (*NodeInf
 // ListNodes is not implemented via broker; CloudProvider falls back to listing Kubernetes Nodes.
 func (c *BrokerClient) ListNodes(ctx context.Context, clusterID string) ([]*NodeInfo, error) {
 	return nil, ErrListNodesUnsupported
+}
+
+// SendBatch sends a batch of node-add items to edge-broker via KarpenterBatchService.BatchStreamOperations.
+// It opens a short-lived stream, sends the request, waits for KarpenterBatchAccepted, and returns the
+// batch_id. The broker queues the batch for sequential processing. A broker-side rejection
+// (queue full) is returned as ErrBatchRejected.
+func (c *BrokerClient) SendBatch(ctx context.Context, nodes []*v1.KarpenterBatchNodeAddItem) (string, error) {
+	if strings.TrimSpace(c.StreamID) == "" {
+		return "", fmt.Errorf("STREAM_ID is required")
+	}
+	var batchID string
+	err := c.callBrokerOnce(ctx, func(cc *grpc.ClientConn) error {
+		callCtx, cancel := context.WithTimeout(c.streamContext(ctx), brokerCallTimeout)
+		defer cancel()
+		id, err := sendBatch(callCtx, cc, nodes)
+		if err != nil {
+			return err
+		}
+		batchID = id
+		return nil
+	})
+	return batchID, err
+}
+
+// SendBatchRemove sends a batch of node-remove items to edge-broker via
+// KarpenterBatchService.BatchStreamOperations. It opens a short-lived stream, sends the request,
+// waits for KarpenterBatchAccepted, and returns the batch_id. The broker queues the batch for
+// sequential processing. A broker-side rejection (queue full) is returned as ErrBatchRejected.
+func (c *BrokerClient) SendBatchRemove(ctx context.Context, nodes []*v1.KarpenterBatchNodeRemoveItem) (string, error) {
+	if strings.TrimSpace(c.StreamID) == "" {
+		return "", fmt.Errorf("STREAM_ID is required")
+	}
+	var batchID string
+	err := c.callBrokerOnce(ctx, func(cc *grpc.ClientConn) error {
+		callCtx, cancel := context.WithTimeout(c.streamContext(ctx), brokerCallTimeout)
+		defer cancel()
+		id, err := sendBatchRemove(callCtx, cc, nodes)
+		if err != nil {
+			return err
+		}
+		batchID = id
+		return nil
+	})
+	return batchID, err
+}
+
+// PollBatchStatus polls edge-broker for the current per-node status of a batch.
+func (c *BrokerClient) PollBatchStatus(ctx context.Context, batchID string) ([]*v1.KarpenterBatchNodeResult, error) {
+	if strings.TrimSpace(c.StreamID) == "" {
+		return nil, fmt.Errorf("STREAM_ID is required")
+	}
+	var results []*v1.KarpenterBatchNodeResult
+	err := c.callBroker(ctx, func(cc *grpc.ClientConn) error {
+		callCtx, cancel := context.WithTimeout(c.streamContext(ctx), brokerCallTimeout)
+		defer cancel()
+		r, err := pollBatchStatus(callCtx, cc, batchID)
+		if err != nil {
+			return err
+		}
+		results = r
+		return nil
+	})
+	return results, err
+}
+
+// GetKarpenterConfig fetches this cluster's node pools and node SKUs from edge-broker, rendered
+// as RafayNodeClass and NodePool manifests (rep.edge.v1.KarpenterConfigService).
+//
+// The broker resolves the cluster from the mTLS client certificate; clusterID/projectID are
+// sent for its logs only. Unlike the batch calls this is a plain unary RPC, so it goes through
+// callBroker and gets the one-shot redial on Unavailable — a retried read is harmless.
+func (c *BrokerClient) GetKarpenterConfig(ctx context.Context, clusterID, projectID string) (*v1.KarpenterConfigResponse, error) {
+	if strings.TrimSpace(c.StreamID) == "" {
+		return nil, fmt.Errorf("STREAM_ID is required")
+	}
+	var resp *v1.KarpenterConfigResponse
+	err := c.callBroker(ctx, func(cc *grpc.ClientConn) error {
+		callCtx, cancel := context.WithTimeout(c.streamContext(ctx), karpenterConfigCallTimeout)
+		defer cancel()
+		r, err := v1.NewKarpenterConfigServiceClient(cc).GetKarpenterConfig(callCtx, &v1.KarpenterConfigRequest{
+			ClusterId: clusterID,
+			ProjectId: projectID,
+		})
+		if err != nil {
+			return err
+		}
+		resp = r
+		return nil
+	})
+	return resp, err
+}
+
+// CancelOperations asks edge-broker to cancel the given operations (best-effort: only ops still
+// ACCEPTED at the broker are cancelled). Returns the operation IDs actually cancelled.
+func (c *BrokerClient) CancelOperations(ctx context.Context, operationIDs []string) ([]string, error) {
+	if strings.TrimSpace(c.StreamID) == "" {
+		return nil, fmt.Errorf("STREAM_ID is required")
+	}
+	var cancelled []string
+	err := c.callBroker(ctx, func(cc *grpc.ClientConn) error {
+		callCtx, cancel := context.WithTimeout(c.streamContext(ctx), brokerCallTimeout)
+		defer cancel()
+		ids, err := cancelOps(callCtx, cc, operationIDs)
+		if err != nil {
+			return err
+		}
+		cancelled = ids
+		return nil
+	})
+	return cancelled, err
 }

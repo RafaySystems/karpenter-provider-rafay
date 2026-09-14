@@ -28,8 +28,7 @@ import (
 )
 
 const (
-	defaultDialTimeout = 30 * time.Second
-	maxMessageSize     = 20 * 1024 * 1024 // 20MB, same as edge-client
+	maxMessageSize = 20 * 1024 * 1024 // 20MB, same as edge-client
 )
 
 // NewSecureGrpcClientConn mirrors edge-client/pkg/util.NewSecureGrpcClientConn (same dial options).
@@ -38,40 +37,32 @@ func NewSecureGrpcClientConn(ctx context.Context, host string, port int, creds c
 }
 
 // NewInsecureGrpcClientConn dials without TLS (rcloud internal broker listener, typically :5449).
-func NewInsecureGrpcClientConn(ctx context.Context, host string, port int) (*grpc.ClientConn, error) {
-	nctx, cancel := context.WithTimeout(ctx, defaultDialTimeout)
-	defer cancel()
+func NewInsecureGrpcClientConn(_ context.Context, host string, port int) (*grpc.ClientConn, error) {
 	addr := fmt.Sprintf("%s:%d", host, port)
-	opts := []grpc.DialOption{
+	return grpc.NewClient(addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:                30 * time.Second,
+			Time:                5 * time.Minute,
 			Timeout:             30 * time.Second,
-			PermitWithoutStream: true,
+			PermitWithoutStream: false,
 		}),
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxMessageSize)),
 		grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(maxMessageSize)),
-	}
-	return grpc.DialContext(nctx, addr, opts...)
+	)
 }
 
 // Dial opens a gRPC connection to the edge-broker (same options as edge-client).
-// Connection is not kept open; caller must defer conn.Close().
-func Dial(ctx context.Context, host string, port int, creds credentials.TransportCredentials) (*grpc.ClientConn, error) {
-	nctx, cancel := context.WithTimeout(ctx, defaultDialTimeout)
-	defer cancel()
+// The connection is established lazily; BrokerClient reuses it across calls via getConn.
+func Dial(_ context.Context, host string, port int, creds credentials.TransportCredentials) (*grpc.ClientConn, error) {
 	addr := fmt.Sprintf("%s:%d", host, port)
-	opts := []grpc.DialOption{
+	return grpc.NewClient(addr,
 		grpc.WithTransportCredentials(creds),
-		grpc.WithBlock(),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:                30 * time.Second,
+			Time:                5 * time.Minute,
 			Timeout:             30 * time.Second,
-			PermitWithoutStream: true,
+			PermitWithoutStream: false,
 		}),
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxMessageSize)),
 		grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(maxMessageSize)),
-	}
-	return grpc.DialContext(nctx, addr, opts...)
+	)
 }

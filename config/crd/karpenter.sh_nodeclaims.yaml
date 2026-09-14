@@ -22,11 +22,16 @@ spec:
         - jsonPath: .metadata.labels.node\.kubernetes\.io/instance-type
           name: Type
           type: string
+        # Capacity and Zone are demoted to -o wide (priority 1): on Rafay every instance type
+        # is on-demand and the zone is the synthetic "default", so both print the same value on
+        # every row.
         - jsonPath: .metadata.labels.karpenter\.sh/capacity-type
           name: Capacity
+          priority: 1
           type: string
         - jsonPath: .metadata.labels.topology\.kubernetes\.io/zone
           name: Zone
+          priority: 1
           type: string
         - jsonPath: .status.nodeName
           name: Node

@@ -1,0 +1,36 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: headroom-policy
+  namespace: karpenter
+data:
+  policy: |
+    # Headroom buffer policy — one Deployment of pause pods per pool ("headroom-<pool>").
+    #
+    # For each resource: buffer = percentage x total allocatable of the pool's READY nodes.
+    # Replicas = max over configured resources of ceil(buffer / per-pod size), floored at
+    # minPods. Pod requests are exactly the per-pod sizes (podCPU/podMemory/podGPU), so
+    # preempting one pod frees a predictable slice of capacity.
+    #
+    # Real workloads (priority >= 0) preempt the pause pods, freeing capacity instantly.
+    # The ReplicaSet replaces evicted pods; the Pending replacements make Karpenter
+    # provision new nodes, restoring the buffer.
+    pools:
+      - name: worker-pool-amd    # must match NodePool .metadata.name exactly
+        cpu: 30%                 # keep 30% of the pool's total CPU pre-reserved
+        memory: 20%              # keep 20% of the pool's total memory pre-reserved
+        podCPU: 500m             # per-pod CPU slice (default 500m if omitted)
+        podMemory: 512Mi         # per-pod memory slice (default 512Mi if omitted)
+        minPods: 2               # cold-start floor: keep 2 pods even with zero ready nodes,
+                                 # so Karpenter provisions the first nodes of an empty pool
+      - name: worker-pool-gpu
+        cpu: 10%
+        memory: 10%
+        gpu: 25%                 # GPU buffer requires podGPU below (no default)
+        podCPU: "1"
+        podMemory: 2Gi
+        podGPU: "1"              # one GPU per pause pod
+        tolerations:             # optional; headroom pods get NO blanket toleration —
+          - key: nvidia.com/gpu  # list exactly the taints they are allowed to cross
+            operator: Exists
+            effect: NoSchedule

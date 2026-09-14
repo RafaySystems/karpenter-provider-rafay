@@ -83,9 +83,19 @@ func getServerHostFromCert(certPath string) (string, error) {
 	return "", fmt.Errorf("invalid cert: no OU for server host")
 }
 
-// GetEdgeIDFromClientCert returns Subject Organization (O) from the client certificate.
-// Edge-broker identifies the client with this field from the mTLS peer certificate
-// (see edge-common GetEdgeClientInfo); it must match how edge-client certs are issued.
+// EdgeHashIDFromOrganization returns the edge id hash from Subject Organization (O):
+// the substring before the first '.', e.g. "7dkgjkx" from "7dkgjkx.cluster.example.com".
+func EdgeHashIDFromOrganization(org string) string {
+	org = strings.TrimSpace(org)
+	if org == "" {
+		return ""
+	}
+	return strings.Split(org, ".")[0]
+}
+
+// GetEdgeIDFromClientCert returns the edge id hash from the client certificate Subject Organization (O),
+// i.e. strings.Split(O, ".")[0] after trimming. The broker still receives the full TLS peer cert over mTLS;
+// this value is used for local logging and optional EDGE_ID checks (same convention as edge hash id elsewhere).
 func GetEdgeIDFromClientCert(certPath string) (string, error) {
 	pemCert, err := os.ReadFile(certPath)
 	if err != nil {
@@ -106,5 +116,9 @@ func GetEdgeIDFromClientCert(certPath string) (string, error) {
 	if o == "" {
 		return "", fmt.Errorf("certificate %s has empty Subject Organization (O)", certPath)
 	}
-	return o, nil
+	hash := EdgeHashIDFromOrganization(o)
+	if hash == "" {
+		return "", fmt.Errorf("certificate %s: Subject O %q yields empty edge id (first DNS label)", certPath, o)
+	}
+	return hash, nil
 }

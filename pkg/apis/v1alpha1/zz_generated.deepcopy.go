@@ -24,6 +24,16 @@ import (
 // DeepCopyInto copies the receiver into out.
 func (in *InstanceTypeSpec) DeepCopyInto(out *InstanceTypeSpec) {
 	*out = *in
+	if in.Architectures != nil {
+		in, out := &in.Architectures, &out.Architectures
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
+	if in.OperatingSystems != nil {
+		in, out := &in.OperatingSystems, &out.OperatingSystems
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
 }
 
 // DeepCopy returns a copy of the receiver.

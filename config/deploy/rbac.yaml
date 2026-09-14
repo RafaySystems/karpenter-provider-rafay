@@ -22,11 +22,19 @@ rules:
     resources: ["namespaces", "configmaps", "secrets", "serviceaccounts"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["apps"]
-    resources: ["daemonsets", "deployments", "replicasets", "statefulsets"]
+    resources: ["daemonsets", "replicasets", "statefulsets"]
     verbs: ["get", "list", "watch"]
+  # Headroom controller manages per-pool pause-pod Deployments
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["policy"]
     resources: ["poddisruptionbudgets"]
     verbs: ["get", "list", "watch"]
+  # Headroom controller registers the rafay-headroom PriorityClass
+  - apiGroups: ["scheduling.k8s.io"]
+    resources: ["priorityclasses"]
+    verbs: ["get", "list", "watch", "create"]
   # Storage / CSI (Karpenter watches these for scheduling; without this: VolumeAttachment list forbidden)
   - apiGroups: ["storage.k8s.io"]
     resources:
