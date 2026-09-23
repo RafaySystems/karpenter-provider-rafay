@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/awslabs/operatorpkg/status"
 	"github.com/samber/lo"
@@ -86,18 +87,24 @@ type CloudProvider struct {
 	clusterID string
 	projectID string
 	batcher   *rafay.NodeBatcher
+	// poolBackoff holds back NodePools the broker refused to grow because they are at their
+	// platform maximum; GetInstanceTypes consults it. Shared with the batch failure handler,
+	// which marks pools. May be nil (no backoff).
+	poolBackoff *PoolBackoff
 }
 
 // NewCloudProvider returns a Rafay cloud provider that uses the given Rafay client.
 // The batcher must already be started (call BrokerClient.StartBatcher) before Create is called.
-func NewCloudProvider(kubeClient client.Client, apiReader client.Reader, rafayClient rafay.Client, clusterID, projectID string, batcher *rafay.NodeBatcher) *CloudProvider {
+// poolBackoff is the store NewBatchFailureHandler marks; nil disables the pool-at-maximum backoff.
+func NewCloudProvider(kubeClient client.Client, apiReader client.Reader, rafayClient rafay.Client, clusterID, projectID string, batcher *rafay.NodeBatcher, poolBackoff *PoolBackoff) *CloudProvider {
 	return &CloudProvider{
-		kubeClient: kubeClient,
-		apiReader:  apiReader,
-		client:     rafayClient,
-		clusterID:  clusterID,
-		projectID:  projectID,
-		batcher:    batcher,
+		kubeClient:  kubeClient,
+		apiReader:   apiReader,
+		client:      rafayClient,
+		clusterID:   clusterID,
+		projectID:   projectID,
+		batcher:     batcher,
+		poolBackoff: poolBackoff,
 	}
 }
 
@@ -140,8 +147,8 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 	if adoptedID := nodeClaim.Annotations[AdoptedProviderIDAnnotationKey]; adoptedID != "" {
 		out := nodeClaim.DeepCopy()
 		out.Status.ProviderID = adoptedID
-		out.Status.Capacity = selected.Capacity
-		out.Status.Allocatable = selected.Allocatable()
+		out.Status.Capacity = nodeClaimResources(selected.Capacity)
+		out.Status.Allocatable = nodeClaimResources(selected.Allocatable())
 		// Labels are deliberately NOT overlaid from the instance type here, unlike the provisioning
 		// path below. The adoption controller derived this NodeClaim's well-known labels from the
 		// node itself, and Karpenter merges whatever Create() returns into the stored NodeClaim —
@@ -174,8 +181,8 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 		// resolve and patch the real ProviderID once the node joins the cluster (~12 min).
 		out := nodeClaim.DeepCopy()
 		out.Status.ProviderID = PendingProviderIDPrefix + string(nodeClaim.UID)
-		out.Status.Capacity = selected.Capacity
-		out.Status.Allocatable = selected.Allocatable()
+		out.Status.Capacity = nodeClaimResources(selected.Capacity)
+		out.Status.Allocatable = nodeClaimResources(selected.Allocatable())
 		out.Labels = lo.Assign(out.Labels, requirementsToLabels(selected.Requirements))
 		if result.BatchID != "" {
 			out.Annotations = lo.Assign(out.Annotations, map[string]string{BatchIDAnnotationKey: result.BatchID})
@@ -430,7 +437,35 @@ func (c *CloudProvider) GetInstanceTypes(ctx context.Context, nodePool *karpv1.N
 	if err != nil {
 		return nil, err
 	}
-	return c.getInstanceTypes(ctx, nodeClass)
+	its, err := c.getInstanceTypes(ctx, nodeClass)
+	if err != nil {
+		return nil, err
+	}
+	// A pool the broker reported at its platform maximum gets no available offerings until the
+	// cooldown ends: the scheduler then leaves its pods pending ("no instance type has the
+	// required offering") instead of creating NodeClaims the broker would refuse again. Create()
+	// resolves instance types by NodeClass, not through here, so a launch already under way is
+	// unaffected.
+	if until, held := c.poolBackoff.Until(nodePool.Name); held {
+		markOfferingsUnavailable(its)
+		klog.V(2).Infof("GetInstanceTypes: pool %q is at its platform maximum; offerings unavailable until %s", nodePool.Name, until.Format(time.RFC3339))
+	}
+	return its, nil
+}
+
+// nodeClaimResources returns the instance type resource list as it is reported on a NodeClaim's
+// status: without the scheduler-only "nodes" entry, so the status reads like the node's own
+// capacity. Karpenter's cluster state adds the node count itself (StateNode.Capacity), so nothing
+// is lost.
+func nodeClaimResources(rl corev1.ResourceList) corev1.ResourceList {
+	out := make(corev1.ResourceList, len(rl))
+	for k, v := range rl {
+		if k == resources.Node {
+			continue
+		}
+		out[k] = v
+	}
+	return out
 }
 
 func (c *CloudProvider) getInstanceTypes(ctx context.Context, nodeClass *v1alpha1.RafayNodeClass) ([]*cloudprovider.InstanceType, error) {
@@ -514,6 +549,16 @@ func rafayInstanceTypesToKarpenter(specs []v1alpha1.InstanceTypeSpec) ([]*cloudp
 			corev1.ResourceCPU:    cpu,
 			corev1.ResourceMemory: mem,
 			corev1.ResourcePods:   resource.MustParse("110"),
+			// One machine per instance type, so NodePool.spec.limits.nodes (the broker renders the
+			// pool's maxNodeCount there) holds WITHIN a scheduling round, not only between rounds.
+			// Karpenter's scheduler subtracts an existing node's capacity from the pool's remaining
+			// limits with "nodes: 1" added by the cluster state, but subtracts a NodeClaim it has
+			// just decided to create using the instance type's capacity as declared here. Without
+			// this entry a pool with one slot left and two pending pods gets two NodeClaims, the
+			// broker refuses the batch, and Karpenter re-asks every few minutes (see docs/
+			// architecture.md, "Pool maximum: three layers"). Stripped again before the value is
+			// copied onto a NodeClaim's status (nodeClaimResources).
+			resources.Node: resource.MustParse("1"),
 		}
 		// TEMPORARY accelerator capacity — see InstanceTypeSpec.GPU for what has to be removed
 		// with it. A zero count is dropped rather than advertised: Karpenter copies a NodeClaim's
@@ -625,7 +670,15 @@ func filterCompatibleInstanceTypes(instanceTypes []*cloudprovider.InstanceType, 
 // out the 60-minute registration timeout. Only NodeClaims still carrying a pending
 // ProviderID are deleted. Remove-operation failures are logged only (Karpenter retries
 // Delete as long as the node object exists).
-func NewBatchFailureHandler(kubeClient client.Client, apiReader client.Reader) rafay.FailureHandler {
+//
+// One failure is not transient: the broker refusing the node because the pool is already at its
+// platform maximum (IsPoolAtMaxDetail). Reprovisioning right away would be refused again, so
+// before deleting the NodeClaim the handler marks its NodePool in poolBackoff; GetInstanceTypes
+// then withholds the pool's offerings for the cooldown and Karpenter leaves the pods pending
+// instead of re-asking every few minutes. The NodeClaim is still deleted — kept, it would be an
+// in-flight node the scheduler expects the pods to land on, for the full 60-minute registration
+// timeout. A nil poolBackoff keeps the plain delete-and-reprovision behaviour.
+func NewBatchFailureHandler(kubeClient client.Client, apiReader client.Reader, poolBackoff *PoolBackoff) rafay.FailureHandler {
 	return func(ctx context.Context, operationID, kind, detail string) {
 		if kind != "add" {
 			klog.Warningf("batch %s operation failed operationID=%s: %s", kind, operationID, detail)
@@ -647,6 +700,12 @@ func NewBatchFailureHandler(kubeClient client.Client, apiReader client.Reader) r
 			if (pid != "" && !strings.HasPrefix(pid, PendingProviderIDPrefix)) || nc.DeletionTimestamp != nil {
 				klog.Warningf("batch add failed operationID=%s (%s): nodeclaim %s not pending (providerID=%q deleting=%t), leaving it alone", operationID, detail, nc.Name, pid, nc.DeletionTimestamp != nil)
 				return
+			}
+			if IsPoolAtMaxDetail(detail) {
+				pool := nc.Labels[karpv1.NodePoolLabelKey]
+				if until := poolBackoff.Mark(pool); !until.IsZero() {
+					klog.Warningf("batch add failed operationID=%s (%s): pool %q is at its platform maximum; holding back provisioning for it until %s", operationID, detail, pool, until.Format(time.RFC3339))
+				}
 			}
 			klog.Warningf("batch add failed operationID=%s (%s): deleting nodeclaim %s so Karpenter reprovisions immediately", operationID, detail, nc.Name)
 			if err := kubeClient.Delete(ctx, nc); err != nil {

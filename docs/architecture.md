@@ -187,7 +187,8 @@ Runs as a Kubernetes Deployment inside the managed cluster. Implements the Karpe
 | Sub-component | Package | Responsibility |
 |---------------|---------|----------------|
 | **CloudProvider** | `pkg/cloudprovider` | `Create`, `Delete`, `Get`, `List`, `GetInstanceTypes`. `Create` and `Delete` both return immediately after broker ACK. `Create` selects the **cheapest compatible instance type** (synthetic price) and returns a synthetic pending ProviderID. |
-| **Batch failure handler** | `pkg/cloudprovider` | `NewBatchFailureHandler` — invoked by the batcher on a terminal FAILED result. On a FAILED **add** it deletes the matching pending NodeClaim so Karpenter reprovisions immediately instead of waiting out the 60-min registration timeout; FAILED **remove** operations are log-only (Karpenter keeps calling `Delete`, which re-sends the removal). |
+| **Batch failure handler** | `pkg/cloudprovider` | `NewBatchFailureHandler` — invoked by the batcher on a terminal FAILED result. On a FAILED **add** it deletes the matching pending NodeClaim so Karpenter reprovisions immediately instead of waiting out the 60-min registration timeout; FAILED **remove** operations are log-only (Karpenter keeps calling `Delete`, which re-sends the removal). One add failure is not transient: a detail starting `pool at maximum` (the broker refused the node because the pool is at its platform maximum). The handler then first marks the NodePool in the shared `PoolBackoff` (default 5 min, `RAFAY_POOL_AT_MAX_COOLDOWN`), and `GetInstanceTypes` reports that pool's offerings unavailable for the cooldown, so Karpenter leaves the pods pending instead of re-asking every few minutes. |
+| **Pool backoff** | `pkg/cloudprovider` | `PoolBackoff` — per-NodePool "held back until" store shared by the failure handler (marks) and `GetInstanceTypes` (withholds offerings). `IsPoolAtMaxDetail` is the contract with the broker's FAILED detail. See [Pool maximum: three layers](#pool-maximum-three-layers). |
 | **NodeProviderIDController** | `pkg/controllers/nodeproviderid` | Watches NodeClaims with `rafay://pending/` ProviderID + real Rafay nodes. Patches real ProviderID once node joins. Single-threaded (`MaxConcurrentReconciles: 1`). |
 | **BrokerClient** | `pkg/rafay` | One shared `*grpc.ClientConn`. `SendBatch`, `SendBatchRemove`, `PollBatchStatus`, `CancelOperations` — each a short-lived stream on `BatchStreamOperations` with a 30s deadline — plus `GetKarpenterConfig`, a unary call on `KarpenterConfigService` (90s deadline: the broker fans out to PaaS per node SKU). |
 | **Node config controller** | `pkg/controllers/nodeconfig` | Leader-elected runnable. Fetches this cluster's `RafayNodeClass` / `NodePool` manifests from edge-broker and server-side-applies them (classes first) at startup, then every `KARPENTER_CONFIG_SYNC_INTERVAL`. Skips an unchanged revision, applies nothing when the compute instance has autoscaling off, and **never prunes**. A `NotFound` from the broker ("this cluster has no Karpenter config" — no workspace compute instance, or no worker-pool catalog) is a quiet no-op sync re-checked at the normal interval, not an error-backoff retry. See [§7.1](#71-catalog--rafaynodeclass-bootstrap). |
@@ -483,8 +484,9 @@ Because a NodeClaim can accept more than one `sku_name` value, `sku_name` **cann
 
 `NodeClaimSKUs` is exported because the same matching rule has to hold in three places that must not disagree: `Delete`'s `findNodeProviderID`, the [`NodeProviderIDController`](#pkgcontrollersnodeproviderid--providerid-resolution-controller), and the [`NodeAdoptionController`](#pkgcontrollersnodeadoption--existing-node-adoption-controller) — the last two being complementary halves of one decision about which NodeClaim owns a node.
 
-**`NewBatchFailureHandler(kubeClient, apiReader)`** returns the `rafay.FailureHandler` wired in `main.go`:
+**`NewBatchFailureHandler(kubeClient, apiReader, poolBackoff)`** returns the `rafay.FailureHandler` wired in `main.go`:
 - kind `"add"`: finds the NodeClaim whose UID equals the operationID and **deletes it** — but only if it still carries a pending ProviderID and has no deletion timestamp. Karpenter then reprovisions immediately (seconds) instead of waiting out the 60-minute registration timeout.
+- kind `"add"` with a detail the broker uses for a pool at its platform maximum (`IsPoolAtMaxDetail`: `pool at maximum`, or the older `is at its maximum`): **first marks the NodeClaim's NodePool in `poolBackoff`**, then deletes the NodeClaim as above. Reprovisioning at once would be refused again, so `GetInstanceTypes` withholds the pool's offerings for the cooldown (`DefaultPoolAtMaxCooldown` = 5 min, `RAFAY_POOL_AT_MAX_COOLDOWN`) and the scheduler leaves the pods pending with `no instance type has the required offering`. The NodeClaim is still deleted: kept, it would be an in-flight node the scheduler expects the pods to land on, for the whole 60-minute registration timeout. A nil `poolBackoff` (or a `0` cooldown) restores plain delete-and-reprovision.
 - kind `"remove"`: log-only — nothing to clean up client-side. The operationID is cleared from the in-flight set, and Karpenter keeps calling `Delete` (every 5s, while the NodeClaim is terminating), so the next call re-sends the removal and the broker rewrites the FAILED record to ACCEPTED.
 
 ---
@@ -679,7 +681,10 @@ Pod unschedulable
         ├─ SUCCEEDED → recorded in the batcher's `succeeded` set (adds: not on the
         │               registration critical path — the joined node is)
         └─ FAILED    → FailureHandler deletes the pending NodeClaim
-                        └─▶ Karpenter reprovisions immediately (fresh NodeClaim, fresh UID)
+                        ├─▶ Karpenter reprovisions immediately (fresh NodeClaim, fresh UID)
+                        └─▶ unless the detail says "pool at maximum": the NodePool is held
+                            back first (offerings unavailable for 5 min), so the pods stay
+                            pending instead of a new NodeClaim being refused again
 
   [~12 minutes later]
 
@@ -900,6 +905,25 @@ lands as `spec.limits.nodes` plus a `karpenter.rafay.io/max-nodes` annotation; t
 annotation-only (`karpenter.rafay.io/min-nodes`) — a NodePool has no floor, headroom is the
 mechanism that holds warm capacity. A disabled row's bounds are not rendered at all (the driver
 never validated them).
+
+#### Pool maximum: three layers
+
+`spec.limits.nodes` alone did not hold the ceiling. On 2026-09-23 a pool with 3 of max 4 nodes
+and two pending pods looped for half an hour: Karpenter created **two** NodeClaims per round,
+the broker refused the whole batch (`3 + 2 would exceed max 4`), the failure handler deleted
+both, Karpenter recreated two five seconds later — every 2½ minutes (10 s batch window + 120 s
+initial poll delay + 30 s poll tick), never placing the one pod that would have fit. The cause is
+in Karpenter core, upstream and fork alike: the scheduler charges an *existing* node one `nodes`
+unit against the limit (`StateNode.Capacity()` adds it), but charges a NodeClaim it has *just
+planned in the same round* only what the instance type's capacity declares (`subtractMax`), and
+the in-round guard fires only when zero nodes remain. Upstream's own tests provision one pod per
+round. Three layers now hold the ceiling, each covering the one above:
+
+| Layer | Where | What it does |
+|---|---|---|
+| **Scheduler** | `rafayInstanceTypesToKarpenter` sets `nodes: 1` on every instance type's `Capacity` | Each planned NodeClaim now consumes one unit of the pool's remaining `limits.nodes` within the round, so with one slot left only one NodeClaim is created and the other pod is reported `node limits have been exhausted for nodepool`. The entry is stripped again (`nodeClaimResources`) before the capacity is copied onto a NodeClaim's status, so `kubectl get nodeclaim` still reads like the node. |
+| **Broker** | edge-broker `firstClassKarpenterBackend.AddNodes` (`applyDeltasToCluster`) | A batch past `scaling.max` is **clamped**, not refused: the nodes that fit are applied and the rest come back `FAILED` with a detail starting `pool at maximum`. Catches the cases the scheduler cannot see — the platform count moving under Karpenter (a node added from the console, a maximum lowered in the catalog before the next config sync). |
+| **Provider backoff** | `PoolBackoff` + `NewBatchFailureHandler` + `GetInstanceTypes` | A `pool at maximum` failure holds the NodePool back for `RAFAY_POOL_AT_MAX_COOLDOWN` (default 5 min): its offerings are reported unavailable, so no new NodeClaim is created for it until the platform view and Karpenter's have had time to converge (node adoption of the console-added node, the 10-minute config sync lowering `limits.nodes`). The refused NodeClaim is still deleted — kept, it would be a phantom in-flight node for 60 minutes. |
 
 Turning a pool's `autoScaling` **off** now takes effect on the next resync: the server-side
 apply rewrites its NodePool into the inert shape, so scale-out and consolidation stop without
@@ -1139,6 +1163,7 @@ t=60m     registrationTimeout backstop — only reached if the broker reported n
 |-------|----------|-------|
 | Batch: per-RPC deadline (send/poll/cancel) | `brokerCallTimeout` | 30s |
 | Batch: initial wait before first poll (per batch) | `defaultInitialDelay` | 120s |
+| Pool-at-maximum hold per NodePool (after a `pool at maximum` FAILED add) | `DefaultPoolAtMaxCooldown` | 5m (`RAFAY_POOL_AT_MAX_COOLDOWN`) |
 | Batch: interval between status polls | `defaultPollInterval` | 30s |
 | Batch: collection window (starts at first item) | `defaultBatchWindow` | 10s |
 | Batch: max items per batch | `defaultMaxBatchSize` | 10 |
@@ -1184,6 +1209,7 @@ t=60m     registrationTimeout backstop — only reached if the broker reported n
 | `STREAM_ID` | (auto UUID v4) | gRPC `sessionid` metadata header — auto-generated if unset |
 | `RAFAY_CLUSTER_ID` | — | Rafay cluster ID stamped on every broker add/remove payload. Sole source — no per-NodeClass override exists. |
 | `RAFAY_PROJECT_ID` | — | Rafay project ID stamped on every broker add/remove payload, when the platform requires it. Sole source. |
+| `RAFAY_POOL_AT_MAX_COOLDOWN` | `5m` | How long a NodePool is held back from provisioning after the broker refused an add because the pool is at its platform maximum (Go duration). `0` disables the hold and restores delete-and-reprovision-immediately. See [Pool maximum: three layers](#pool-maximum-three-layers). |
 
 ### Controller Behavior
 
@@ -1333,7 +1359,7 @@ Node existence is deliberately **not** the completion signal for removes: Karpen
 
 ### Failure feedback via status poller + failure handler
 
-Because callers unblock at ACK, broker-side failures need an asynchronous path back into the cluster: the status poller maps terminal FAILED results to the `FailureHandler`, which deletes the still-pending NodeClaim (UID == operationID). Karpenter reprovisions within seconds instead of waiting out the 60-minute registration-timeout backstop.
+Because callers unblock at ACK, broker-side failures need an asynchronous path back into the cluster: the status poller maps terminal FAILED results to the `FailureHandler`, which deletes the still-pending NodeClaim (UID == operationID). Karpenter reprovisions within seconds instead of waiting out the 60-minute registration-timeout backstop. The one failure that must *not* be retried at once — the broker refusing the node because the pool is at its platform maximum (`pool at maximum`) — additionally holds the NodePool back for a cooldown through `PoolBackoff`, so the scheduler withholds the pool rather than creating a NodeClaim the broker would refuse again (see [Pool maximum: three layers](#pool-maximum-three-layers)).
 
 SUCCEEDED results are **recorded**, not merely logged. For adds the record is incidental — registration is driven by the node actually joining. For **removes** it is the convergence signal that lets `Delete()` return `NodeClaimNotFoundError` and release the Node's termination finalizer.
 

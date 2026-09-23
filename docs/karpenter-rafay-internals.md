@@ -162,8 +162,12 @@ every terminal FAILED result (and for items of expired batches). The wired handl
 (`cloudprovider.NewBatchFailureHandler`, registered in `main.go` before `StartBatcher`) deletes
 the NodeClaim whose UID matches a failed **add** operationID — but only while it still carries a
 pending ProviderID and has no deletion timestamp — so a failed provision is replaced in seconds
-instead of waiting out the 60-minute registration timeout (§2). **Remove** failures are logged
-only: Karpenter retries `Delete()` as long as the node object exists.
+instead of waiting out the 60-minute registration timeout (§2). A `pool at maximum` detail (the
+broker refused the node because the pool is at its platform maximum) is the exception that must
+not be retried at once: the handler first holds the NodePool back in a `PoolBackoff`
+(`RAFAY_POOL_AT_MAX_COOLDOWN`, default 5 min) so `GetInstanceTypes` withholds its offerings, then
+deletes the NodeClaim as usual. **Remove** failures are logged only: Karpenter retries `Delete()`
+as long as the node object exists.
 
 **Cancellation:** `Cancel(operationID)` sends a fire-and-forget `cancel_ops` to the broker
 (10 s timeout, errors logged only). Only operations still queued (ACCEPTED) at the broker are
@@ -211,7 +215,8 @@ for _, item := range batch {
 > **Update:** the poller is no longer log-only.
 > - Terminal **FAILED** results invoke a registered `FailureHandler` that deletes the matching
 >   still-pending NodeClaim (see §4), so a failed provision recovers in seconds instead of via the
->   60-minute registration timeout.
+>   60-minute registration timeout — after holding the NodePool back for a cooldown when the
+>   detail says `pool at maximum`.
 > - Terminal **SUCCEEDED** results are **recorded** in the batcher's `succeeded` set. For adds this
 >   is not on the registration critical path (the node joining is). For **removes** it is the whole
 >   ball game: it is what lets `Delete()` return `NodeClaimNotFoundError` and release the Node's
