@@ -12,7 +12,7 @@ This provider integrates [Karpenter](https://karpenter.sh) with Rafay for privat
 
 ### 1. Install CRDs
 
-Install Karpenter core CRDs (NodeClaim, NodePool from upstream **v1.11.1**, matching `go.mod`) and the Rafay `RafayNodeClass` CRD:
+Install Karpenter core CRDs (NodeClaim, NodePool from upstream **v1.14.1**, matching `go.mod`) and the Rafay `RafayNodeClass` CRD:
 
 ```bash
 kubectl apply -f config/crd/
@@ -124,7 +124,7 @@ Behaviour worth knowing:
 - **No node is provisioned by adoption.** The NodeClaim is annotated `karpenter.rafay.io/adopted-provider-id`, and `CloudProvider.Create()` treats that as "this machine is already running" — it returns the annotated ProviderID without calling edge-broker. Nothing is added to the catalog and `noOfSku` does not change.
 - **Adopted nodes become disruptable.** That is the point — the pool becomes Karpenter's to size — but it means a pre-existing node that goes empty can be consolidated away after `consolidateAfter`. Set **`KARPENTER_ADOPT_EXISTING_NODES=false`** on clusters where the original nodes must stay untouched.
 - **Running pods are not disturbed.** The pool's taints are **not** copied onto adopted NodeClaims (Karpenter syncs a NodeClaim's taints onto its node, and a `NoExecute` taint would evict the pods already there), and topology labels are read from the node rather than inferred from the SKU, so real zone information is never overwritten.
-- **Only `Ready` nodes are adopted.** A node whose kubelet has not reported `Ready` is left completely untouched — no `providerID`, no NodeClaim — and picked up within seconds of becoming Ready. Adopting one early would charge the pool's limits for capacity nothing can schedule on, and a node that never comes up would leave a NodeClaim that nothing reaps for 720h. A node that goes `NotReady` *after* adoption keeps its NodeClaim, and is not counted as waiting. The log line says how many genuinely are:
+- **Only `Ready` nodes are adopted.** A node whose kubelet has not reported `Ready` is left completely untouched — no `providerID`, no NodeClaim — and picked up within seconds of becoming Ready. Adopting one early would charge the pool's limits for capacity nothing can schedule on, and a node that never comes up would leave a NodeClaim that nothing reaps at all (broker-rendered pools set `expireAfter: Never`). A node that goes `NotReady` *after* adoption keeps its NodeClaim, and is not counted as waiting. The log line says how many genuinely are:
 
   ```
   nodeadoption: pool "pool1" has 3 node(s) in the cluster and 2 nodeclaim(s) (3 worker node(s) across all pools); adopted 2, skipped 0, waiting for 1 node(s) to become Ready
@@ -161,15 +161,39 @@ spec:
 ## Building
 
 ```bash
-make build
-# Binary: bin/karpenter-provider-rafay
+make compile   # binary: bin/karpenter-provider-rafay
+make build     # container image (see "Docker image" below)
 ```
+
+### Dependencies
+
+The build is self-contained: a fresh clone — including the Jenkins image build, which only sees the clone — needs nothing outside this repository except GitHub credentials for the private `github.com/RafaySystems/*` modules.
+
+- **`github.com/RafaySystems/edge-common`** is pinned in `go.mod` to a commit pseudo-version, the same commit that `edge-broker` pins, so both ends of the Karpenter batch protocol are generated from one proto definition. Bump it with `make update-deps` (tracks `main`) or `GOPRIVATE=github.com/RafaySystems/* go get github.com/RafaySystems/edge-common@<sha>`, and keep it in step with `edge-broker/go.mod`.
+- **`sigs.k8s.io/karpenter`** is replaced in `go.mod` by the Rafay fork [github.com/RafaySystems/karpenter-rafay](https://github.com/RafaySystems/karpenter-rafay), branch `rafay-release-v1.14.x`: upstream v1.14.1 plus one commit that raises the NodeClaim `registrationTimeout` from 15 to 60 minutes, which upstream does not expose as a setting ([kubernetes-sigs/karpenter#357](https://github.com/kubernetes-sigs/karpenter/issues/357)). The replace pins a commit pseudo-version. To move to a newer fork commit:
+
+  ```bash
+  go mod edit -replace sigs.k8s.io/karpenter=github.com/RafaySystems/karpenter-rafay@rafay-release-v1.14.x   # or @<sha>
+  GOPRIVATE=github.com/RafaySystems/* go mod tidy   # rewrites the branch name as a commit pseudo-version
+  ```
+
+  Then refresh `config/crd/karpenter.sh_*.yaml` from the fork's `pkg/apis/crds/` (keep the header and printer-column tweaks noted in those files). Never point the replace at a sibling checkout; CI cannot see one.
+
+To iterate on unpushed edge-common changes, use a Go workspace instead of editing `go.mod` (`go.work` is git-ignored):
+
+```bash
+go work init . ../edge-common   # go build / go test now use the sibling checkout
+rm go.work go.work.sum          # back to the pinned version
+```
+
+`vendor/` (`make vendor`) is git-ignored and not used by the image build. If you keep one, refresh it with `make vendor` after every `go.mod` change, and remove it while a `go.work` is in place — workspace mode and a `go mod vendor` tree do not mix.
 
 ## Docker image
 
 Build and push use the same registry pattern as [edgesrv](https://github.com/RafaySystems/edgesrv):
 
-- **Base image (build):** `registry-proxy.dev.rafay-edge.net/golang:1.24`
+- **Base image (build):** `registry-proxy.dev.rafay-edge.net/golang:1.26-alpine` (must satisfy the `go` directive in `go.mod`; the image sets `GOTOOLCHAIN=local`). The Alpine version is left floating on purpose: Alpine-pinned tags such as `1.26-alpine3.22` stop being rebuilt once that Alpine release ages out and then fall behind the Go patch level the `go` directive needs.
+- **Build inputs:** the repository checkout plus the `BUILD_USR`/`BUILD_PWD` build args (GitHub credentials for the private modules). These are exactly what the Jenkins `buildAndScan`/`pushImage` library passes, so the `Jenkinsfile` build needs no extra `--build-context`.
 - **Dev push target:** `registry.dev.rafay-edge.net/<DEV_USER>/karpenter-provider-rafay:<branch>-<date>-<time>`
 
 ```bash

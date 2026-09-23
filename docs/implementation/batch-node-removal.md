@@ -85,7 +85,7 @@ and silently no-op.
 ### Delete() must converge — and node existence cannot be how
 
 Karpenter core's `awaitInstanceTermination`
-(`../karpenter/pkg/controllers/node/termination/controller.go`) calls `cloudProvider.Delete()` on
+(Karpenter core `pkg/controllers/node/termination/controller.go`) calls `cloudProvider.Delete()` on
 **every** reconcile and releases the Node's termination finalizer **only** when `Delete()` returns a
 `NodeClaimNotFoundError`. Anything else — including `nil` — requeues after 5 seconds:
 

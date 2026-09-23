@@ -7,3 +7,8 @@
 coverage.out
 *.big
 .claude/worktrees/
+
+# Local-only artifacts: workspace overrides (see README "Dependencies") and go mod vendor output.
+go.work
+go.work.sum
+/vendor/

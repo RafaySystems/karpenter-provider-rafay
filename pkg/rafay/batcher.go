@@ -59,6 +59,7 @@ package rafay
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -109,7 +110,11 @@ const (
 // (or the send fails).
 type BatchResult struct {
 	ProviderID string
-	Err        error
+	// BatchID is the broker batch the operation was sent in. It is set on every successful ACK,
+	// including the in-flight short-circuit, so a caller can persist it — Create() stamps it on
+	// the NodeClaim, which is what lets a restarted provider resume polling (see ResumeAddBatch).
+	BatchID string
+	Err     error
 }
 
 // FailureHandler is invoked by the status poller when the broker reports a terminal FAILED
@@ -170,6 +175,11 @@ type NodeBatcher struct {
 	// already satisfied).
 	inFlight map[string]struct{}
 
+	// opBatch maps every in-flight operationID to the batch it was sent in, so an enqueue that is
+	// short-circuited as in flight can still tell its caller which batch to persist. Kept in step
+	// with inFlight: set where an op becomes in flight, deleted where it leaves.
+	opBatch map[string]string
+
 	// succeeded records operationIDs the broker reported SUCCEEDED, with the time observed.
 	// Delete() consults this to decide when a node removal has actually completed (see Succeeded).
 	// Entries are pruned after succeededRetention.
@@ -200,6 +210,7 @@ func NewNodeBatcher(client *BrokerClient) *NodeBatcher {
 		initialDelay: defaultInitialDelay,
 		inProgress:   make(map[string]*inProgressBatch),
 		inFlight:     make(map[string]struct{}),
+		opBatch:      make(map[string]string),
 		succeeded:    make(map[string]time.Time),
 		pending:      make(map[string][]chan BatchResult),
 	}
@@ -215,6 +226,15 @@ func (b *NodeBatcher) Succeeded(operationID string) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	_, ok := b.succeeded[operationID]
+	return ok
+}
+
+// Tracking reports whether the status poller is currently following batchID. It exists for
+// observability and for the batchresume controller's tests; nothing in the hot path uses it.
+func (b *NodeBatcher) Tracking(batchID string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	_, ok := b.inProgress[strings.TrimSpace(batchID)]
 	return ok
 }
 
@@ -266,10 +286,11 @@ func (b *NodeBatcher) enqueueItem(item batchItem) <-chan BatchResult {
 	// Lock order: mu → pendingMu (mu is released before pendingMu is taken below).
 	b.mu.Lock()
 	_, inFlight := b.inFlight[item.operationID]
+	batchID := b.opBatch[item.operationID]
 	b.mu.Unlock()
 	if inFlight {
 		klog.V(4).Infof("batcher: operationID=%s already in flight at broker — not re-sending", item.operationID)
-		ch <- BatchResult{}
+		ch <- BatchResult{BatchID: batchID}
 		return ch
 	}
 
@@ -486,18 +507,71 @@ func (b *NodeBatcher) registerAndAck(kind, batchID string, batch []batchItem) {
 	// caller returns sees the operation as in flight and does not re-send it.
 	for _, item := range batch {
 		b.inFlight[item.operationID] = struct{}{}
+		b.opBatch[item.operationID] = batchID
 	}
 	b.mu.Unlock()
 
 	for _, item := range batch {
-		b.resolvePending(item.operationID, BatchResult{})
+		b.resolvePending(item.operationID, BatchResult{BatchID: batchID})
 	}
+}
+
+// ResumeAddBatch re-registers an add batch that a previous incarnation of this process sent
+// before it restarted, so the status poller tracks it again. It reports whether the batch was
+// newly registered; a batch already tracked is left untouched.
+//
+// Polling needs only the operation IDs and the kind: terminal states are reported per operation
+// ID and FAILED ones go to the failure handler by kind. The request payloads that built the
+// original batch died with the old process and are not required. The batch is polled without the
+// initial delay (it was sent long ago) and its max-age clock restarts from now, since the original
+// send time is not persisted — the broker's 90-minute batch index is the tighter bound anyway.
+//
+// Only adds are resumable on purpose. A remove needs no resume: Karpenter re-issues Delete() every
+// few seconds with the same deterministic operation ID, the broker answers from its tombstone, and
+// the next poll reports SUCCEEDED. An add has no such loop — once ACKed its NodeClaim is Launched
+// and Create() is never called again — so without this a restarted provider would learn of a
+// failed add only from Karpenter's 60-minute registration timeout.
+func (b *NodeBatcher) ResumeAddBatch(batchID string, operationIDs []string) bool {
+	batchID = strings.TrimSpace(batchID)
+	if batchID == "" {
+		return false
+	}
+	items := make([]batchItem, 0, len(operationIDs))
+	for _, id := range operationIDs {
+		if id = strings.TrimSpace(id); id != "" {
+			items = append(items, batchItem{operationID: id, kind: opKindAdd})
+		}
+	}
+	if len(items) == 0 {
+		return false
+	}
+
+	now := time.Now()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if _, tracked := b.inProgress[batchID]; tracked {
+		return false
+	}
+	b.inProgress[batchID] = &inProgressBatch{
+		batchID:   batchID,
+		kind:      opKindAdd,
+		items:     items,
+		sentAt:    now,
+		pollAfter: now,
+	}
+	for _, item := range items {
+		b.inFlight[item.operationID] = struct{}{}
+		b.opBatch[item.operationID] = batchID
+	}
+	klog.Infof("batcher: resumed add batch batchID=%s nodeCount=%d from a previous process", batchID, len(items))
+	return true
 }
 
 // clearInFlight drops operationIDs from the in-flight set. Callers must hold b.mu.
 func (b *NodeBatcher) clearInFlightLocked(items []batchItem) {
 	for _, item := range items {
 		delete(b.inFlight, item.operationID)
+		delete(b.opBatch, item.operationID)
 	}
 }
 

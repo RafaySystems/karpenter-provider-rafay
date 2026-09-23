@@ -114,8 +114,8 @@ type RafayNodeClassList struct {
 }
 
 // StatusConditions / GetConditions / SetConditions for operatorpkg status.Object.
-func (nc *RafayNodeClass) StatusConditions() status.ConditionSet {
-	return status.NewReadyConditions().For(nc)
+func (nc *RafayNodeClass) StatusConditions(opts ...status.ForOption) status.ConditionSet {
+	return status.NewReadyConditions().For(nc, opts...)
 }
 
 func (nc *RafayNodeClass) GetConditions() []status.Condition {

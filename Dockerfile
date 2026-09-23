@@ -1,11 +1,11 @@
 # syntax=docker/dockerfile:1.6
-# go.mod replace: ../edge-common → /edge-common (sibling of /workspace). Build with:
-#   docker build --build-context edgecommon=../edge-common --build-arg BUILD_USR=... --build-arg BUILD_PWD=...
-FROM --platform=$BUILDPLATFORM registry-proxy.dev.rafay-edge.net/golang:1.24-alpine3.20 as builder
+# Self-contained build: the private github.com/RafaySystems/* modules (edge-common and the Karpenter fork
+# github.com/RafaySystems/karpenter-rafay that the go.mod replace points at) are fetched with BUILD_USR/BUILD_PWD
+# (GitHub credentials), so no extra build context is needed:
+#   docker build --build-arg BUILD_USR=... --build-arg BUILD_PWD=... .
+FROM --platform=$BUILDPLATFORM registry-proxy.dev.rafay-edge.net/golang:1.26-alpine AS builder
 
 RUN apk add --no-cache git build-base
-
-COPY --from=edgecommon . /edge-common
 
 WORKDIR /workspace
 
