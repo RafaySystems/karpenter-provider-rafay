@@ -76,6 +76,12 @@ spec:
         group: karpenter.rafay.io
         kind: RafayNodeClass
         name: oci-inst
+      # Never force-rotate nodes on age. The CRD default (720h) would retire every node 30
+      # days after it was created, and a Rafay removal is a catalog count decrement — the
+      # platform, not Karpenter, picks which machine goes — so age-based expiry only churns
+      # healthy machines through a ~10-minute reprovision. The broker renders the same value
+      # on every pool it bootstraps.
+      expireAfter: Never
   limits:
     cpu: "1000"
     nvidia.com/gpu: "16"
@@ -115,6 +121,8 @@ spec:
         group: karpenter.rafay.io
         kind: RafayNodeClass
         name: oci-inst-arm
+      # No age-based rotation (see worker-pool-amd above).
+      expireAfter: Never
   limits:
     cpu: "1000"
     memory: 1000Gi

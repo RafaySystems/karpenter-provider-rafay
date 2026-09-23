@@ -604,9 +604,9 @@ func claimedByPendingClaim(pendingClaims []*karpv1.NodeClaim, node *corev1.Node,
 //     and charges the pool's limits for, a machine that is not there.
 //   - It would be stuck. Initialization requires NodeReady, so the claim would sit at
 //     Registered=True / Initialized=Unknown("NodeNotReady") — and Liveness only deletes claims that
-//     fail to *register*, which this one did not. Nothing else reaps it either, short of
-//     spec.expireAfter (720h from the pool template), so a node that never comes up leaves a phantom
-//     NodeClaim for 30 days.
+//     fail to *register*, which this one did not. Nothing else reaps it either — not even
+//     expiration, since every broker-rendered pool sets spec.expireAfter: Never — so a node that
+//     never comes up leaves a phantom NodeClaim indefinitely.
 //   - It may not be a node at all. A machine mid-teardown, or one whose kubelet never joined
 //     properly, presents exactly as NotReady; adopting it writes an immutable spec.providerID onto
 //     an object that is on its way out.

@@ -58,6 +58,14 @@ const (
 	// controller restarts.
 	AdoptedProviderIDAnnotationKey = "karpenter.rafay.io/adopted-provider-id"
 
+	// BatchIDAnnotationKey records the broker batch a NodeClaim's add was sent in. Create()
+	// stamps it at ACK and Karpenter merges it onto the stored NodeClaim (lifecycle
+	// PopulateNodeClaimDetails copies returned annotations). The batchresume controller reads it
+	// on startup so a restarted provider resumes polling that batch — otherwise the batch ID
+	// lives only in the old process's memory, and the failure signal for a pending add is lost
+	// until Karpenter's 60-minute registration timeout.
+	BatchIDAnnotationKey = "karpenter.rafay.io/batch-id"
+
 	nodepoolNameLabel = "nodepoolname"
 	skuNameLabel      = "sku_name"
 
@@ -169,7 +177,10 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 		out.Status.Capacity = selected.Capacity
 		out.Status.Allocatable = selected.Allocatable()
 		out.Labels = lo.Assign(out.Labels, requirementsToLabels(selected.Requirements))
-		klog.Infof("Create: broker ACK for nodeclaim=%s, set pending providerID=%s", nodeClaim.Name, out.Status.ProviderID)
+		if result.BatchID != "" {
+			out.Annotations = lo.Assign(out.Annotations, map[string]string{BatchIDAnnotationKey: result.BatchID})
+		}
+		klog.Infof("Create: broker ACK for nodeclaim=%s, set pending providerID=%s batchID=%s", nodeClaim.Name, out.Status.ProviderID, result.BatchID)
 		return out, nil
 	}
 }

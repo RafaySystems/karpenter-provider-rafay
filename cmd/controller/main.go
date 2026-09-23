@@ -28,6 +28,7 @@ import (
 
 	"github.com/RafaySystems/karpenter-provider-rafay/pkg/broker"
 	"github.com/RafaySystems/karpenter-provider-rafay/pkg/cloudprovider"
+	batchresumectrl "github.com/RafaySystems/karpenter-provider-rafay/pkg/controllers/batchresume"
 	headroomctrl "github.com/RafaySystems/karpenter-provider-rafay/pkg/controllers/headroom"
 	nodeadoptionctrl "github.com/RafaySystems/karpenter-provider-rafay/pkg/controllers/nodeadoption"
 	nodeconfigctrl "github.com/RafaySystems/karpenter-provider-rafay/pkg/controllers/nodeconfig"
@@ -194,6 +195,10 @@ func main() {
 	} else {
 		klog.Info("KARPENTER_CONFIG_BOOTSTRAP=false: not syncing RafayNodeClass/NodePool from edge-broker; apply them yourself")
 	}
+	// Resume polling the add batches a previous incarnation of this provider sent. Without it a
+	// restart trades the batcher's ~2-minute failure signal for Karpenter's 60-minute
+	// registration timeout on every add that was in flight.
+	allCtrls = append(allCtrls, batchresumectrl.NewController(op.Manager.GetAPIReader(), rafayClient.Batcher()))
 	allCtrls = append(allCtrls, coreCtrls...)
 
 	op.WithControllers(ctx, allCtrls...).Start(ctx)

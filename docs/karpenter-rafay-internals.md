@@ -579,9 +579,9 @@ if nodeutils.GetCondition(node, corev1.NodeReady).Status != corev1.ConditionTrue
 }
 ```
 
-The claim parks at `Registered=True` / `Initialized=Unknown`, and nothing reaps it short of
-`spec.expireAfter` — 720h from the pool template, so a node that never comes up leaves a phantom
-NodeClaim for 30 days. Garbage collection does not help: it only considers claims **absent** from
+The claim parks at `Registered=True` / `Initialized=Unknown`, and nothing reaps it — not even
+expiration, since every broker-rendered pool sets `spec.expireAfter: Never` — so a node that never
+comes up leaves a phantom NodeClaim indefinitely. Garbage collection does not help: it only considers claims **absent** from
 `CloudProvider.List()`, and `listNodesFromKube` returns every Node carrying a `rafay://` providerID —
 which adoption has just stamped on this one.
 

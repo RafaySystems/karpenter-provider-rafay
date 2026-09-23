@@ -134,6 +134,7 @@ func registerBatch(b *NodeBatcher, batchID, kind string, sentAt time.Time, opIDs
 	}
 	for _, id := range opIDs {
 		b.inFlight[id] = struct{}{}
+		b.opBatch[id] = batchID
 	}
 	b.mu.Unlock()
 }
@@ -280,6 +281,106 @@ func TestEnqueueSuppressedWhileInFlight(t *testing.T) {
 	}
 	if r := mustResult(t, ch); r.Err != nil {
 		t.Errorf("in-flight enqueue should resolve successfully, got err: %v", r.Err)
+	}
+}
+
+// TestAckCarriesBatchID pins the seam the batchresume controller depends on: every ACK — the real
+// one from registerAndAck and the in-flight short-circuit — tells the caller which broker batch
+// the operation is in, so Create() can persist it on the NodeClaim.
+func TestAckCarriesBatchID(t *testing.T) {
+	b := newTestBatcher(&mockBroker{})
+	registerBatch(b, "batch-42", opKindAdd, time.Now(), "op-add")
+
+	// Short-circuit path: the op is already in flight from "batch-42".
+	if r := mustResult(t, b.Enqueue("op-add", AddNodesRequest{OperationID: "op-add"})); r.BatchID != "batch-42" {
+		t.Errorf("in-flight ACK BatchID = %q, want batch-42: a retry after a lost ACK must still learn its batch", r.BatchID)
+	}
+
+	// Real ACK path: registerAndAck resolves pending waiters with the broker's batch id.
+	ch := make(chan BatchResult, 1)
+	b.pendingMu.Lock()
+	b.pending["op-new"] = []chan BatchResult{ch}
+	b.pendingMu.Unlock()
+	b.registerAndAck(opKindAdd, "batch-77", []batchItem{{operationID: "op-new", kind: opKindAdd}})
+	if r := mustResult(t, ch); r.BatchID != "batch-77" || r.Err != nil {
+		t.Errorf("ACK result = %+v, want BatchID batch-77 and no error", r)
+	}
+	b.mu.Lock()
+	idx := b.opBatch["op-new"]
+	b.mu.Unlock()
+	if idx != "batch-77" {
+		t.Errorf("opBatch[op-new] = %q, want batch-77", idx)
+	}
+}
+
+// TestResumeAddBatch covers restart recovery on the client side. A resumed batch must be tracked
+// exactly like one this process sent — its ops in flight (so retries are suppressed), polled at
+// once (no initial delay), with terminal FAILED results reaching the failure handler as adds — and
+// resuming a batch that is already tracked must be a no-op.
+func TestResumeAddBatch(t *testing.T) {
+	broker := &mockBroker{
+		pollFn: func(string) ([]*v1.KarpenterBatchNodeResult, error) {
+			return []*v1.KarpenterBatchNodeResult{
+				{OperationId: "op-1", State: v1.KARPENTER_NODE_OPERATION_STATE_FAILED, Detail: "operation record expired"},
+				{OperationId: "op-2", State: v1.KARPENTER_NODE_OPERATION_STATE_SUCCEEDED},
+			}, nil
+		},
+	}
+	b := newTestBatcher(broker)
+	rec := &failureRecorder{}
+	b.SetFailureHandler(rec.handler)
+
+	if b.ResumeAddBatch("", []string{"op-1"}) {
+		t.Error("an empty batch id must not be resumable")
+	}
+	if b.ResumeAddBatch("batch-r", nil) {
+		t.Error("a batch with no operations must not be resumable")
+	}
+	if !b.ResumeAddBatch("batch-r", []string{"op-1", " op-2 ", ""}) {
+		t.Fatal("first resume should register the batch")
+	}
+	if b.ResumeAddBatch("batch-r", []string{"op-1"}) {
+		t.Error("resuming an already-tracked batch must be a no-op")
+	}
+	if !b.Tracking("batch-r") {
+		t.Fatal("resumed batch is not being tracked")
+	}
+
+	// Ops are in flight, so a retry is suppressed and still learns its batch.
+	if got := len(b.queue); got != 0 {
+		t.Fatalf("queue length before enqueue = %d, want 0", got)
+	}
+	if r := mustResult(t, b.Enqueue("op-1", AddNodesRequest{OperationID: "op-1"})); r.BatchID != "batch-r" {
+		t.Errorf("retry of a resumed op: BatchID = %q, want batch-r", r.BatchID)
+	}
+	if got := len(b.queue); got != 0 {
+		t.Errorf("queue length = %d, want 0 (a resumed op must not be re-sent)", got)
+	}
+
+	// No initial delay: the very first poll proceeds and consumes the terminal states.
+	b.pollBatch(context.Background(), "batch-r")
+	if broker.pollCallCount() != 1 {
+		t.Fatalf("poll calls = %d, want 1: a resumed batch must be polled immediately", broker.pollCallCount())
+	}
+	if !b.Succeeded("op-2") {
+		t.Error("SUCCEEDED result on a resumed batch must be recorded")
+	}
+	// The FAILED op reaches the failure handler as an add — the signal that lets the pending
+	// NodeClaim be reaped in minutes instead of at Karpenter's 60-minute registration timeout.
+	calls := rec.snapshot()
+	if len(calls) != 1 || calls[0].operationID != "op-1" || calls[0].kind != opKindAdd || calls[0].detail != "operation record expired" {
+		t.Errorf("failure handler calls = %+v, want exactly one for op-1 as an add with the broker's detail", calls)
+	}
+	b.mu.Lock()
+	_, inFlight1 := b.inFlight["op-1"]
+	_, inFlight2 := b.inFlight["op-2"]
+	_, stillTracked := b.inProgress["batch-r"]
+	b.mu.Unlock()
+	if inFlight1 || inFlight2 {
+		t.Error("terminal ops on a resumed batch must be cleared from the in-flight set")
+	}
+	if stillTracked {
+		t.Error("a fully terminal resumed batch must be dropped from tracking")
 	}
 }
 

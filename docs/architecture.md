@@ -302,7 +302,7 @@ Two resolution paths:
 | 6 | Calls `rafayClient.StartBatcher(ctx)` — launches `NodeBatcher` sender + poller goroutines |
 | 7 | Builds `CloudProvider` (with both the cached client and the uncached `apiReader`), wraps with `metrics.Decorate`, builds `state.NewCluster` |
 | 8 | Resolves headroom namespaces from `HEADROOM_NAMESPACE` / `HEADROOM_CONFIG_NAMESPACE` |
-| 9 | Registers all controllers: `rafaynodeclass`, `nodeproviderid`, `headroom`, `nodeadoption` (unless `KARPENTER_ADOPT_EXISTING_NODES=false`), `nodeconfig` (unless `KARPENTER_CONFIG_BOOTSTRAP=false`), plus upstream Karpenter controllers |
+| 9 | Registers all controllers: `rafaynodeclass`, `nodeproviderid`, `headroom`, `nodeadoption` (unless `KARPENTER_ADOPT_EXISTING_NODES=false`), `nodeconfig` (unless `KARPENTER_CONFIG_BOOTSTRAP=false`), `batchresume`, plus upstream Karpenter controllers |
 | 10 | `op.WithControllers(...).Start(ctx)` — runs until signal |
 
 ---
@@ -456,7 +456,7 @@ Implements `sigs.k8s.io/karpenter/pkg/cloudprovider.CloudProvider`:
 | `Get(providerID)` | For `rafay://pending/` prefix: returns minimal NodeClaim (provisioning in progress). Otherwise: falls back to scanning k8s `NodeList` by `spec.providerID`. **Not** the termination completion signal — see [§6.2](#62-scale-in-node-deprovisioning). |
 | `List()` | `ListNodes` unsupported → falls back to listing **every** k8s Node whose `spec.providerID` carries the `rafay://` prefix. There is deliberately **no cluster-ID filter** — see the note below. |
 | `GetInstanceTypes(NodePool)` | Returns `RafayNodeClass.spec.instanceTypes` parsed and validated. Each offering carries a **synthetic price = 1.0 per vCPU + 0.125 per GiB of memory** so smallest-fit selection and consolidation have a gradient. |
-| `IsDrifted(NodeClaim)` | Always `("", nil)` — no drift detection. |
+| `IsDrifted(NodeClaim)` | Always `("", nil)` — no **cloud-provider** drift. Karpenter core's own drift checks still run, and run *before* this hook is consulted: static drift (`karpenter.sh/nodepool-hash` mismatch — any NodePool template edit, including the `expireAfter` change in [§7.1](#71-catalog--rafaynodeclass-bootstrap)), requirements drift and `instanceTypeNotFound`. |
 | `Name()` | `"rafay"` |
 
 Cluster/project IDs for broker requests have a single source: `RAFAY_CLUSTER_ID` / `RAFAY_PROJECT_ID`, read at startup and captured into `CloudProvider.clusterID` / `.projectID` by `NewCloudProvider`. Both `Create` and `Delete` stamp those values on every `AddNodesRequest` / `RemoveNodesRequest` verbatim. There is no per-NodeClass override and no precedence rule to reason about.
@@ -589,7 +589,7 @@ The marker is an **annotation on the object at creation time**, not a status pre
 
 **Key properties:**
 
-- **Only Ready nodes are adopted** — `nodeutils.GetCondition(node, NodeReady).Status == True`, the same test Karpenter's own `Initialization` reconciler applies. A NodeClaim for a NotReady node is worse than none at all: it is **counted** (while uninitialized, `StateNode.Capacity()` fills any resource the node does not report from the NodeClaim's — so for a node whose kubelet never reported, or whose Node object is later deleted while the claim lives, the SKU's *declared* figures become the whole capacity and the pool's limits are charged for a machine that is not there), and it is **stuck** — `Initialization` requires `NodeReady`, so the claim sits at `Registered=True` / `Initialized=Unknown("NodeNotReady")` while `Liveness` only reaps claims that failed to *register*, and garbage collection only considers claims absent from `List()` — which this one is not, since adoption just stamped a `rafay://` providerID on its node. Nothing reaps it short of `spec.expireAfter` (720h). A machine mid-teardown presents identically, and adopting it writes an **immutable** `spec.providerID` onto an object already on its way out. Waiting costs nothing: the Node watch fires on the status update that flips the condition, so adoption follows within seconds rather than at the next resync. A node that is Ready and *later* goes NotReady keeps its NodeClaim — this gate governs only when to take a node on; from then on Karpenter's **disruption** path owns it (not node repair: that controller is only registered when `RepairPolicies()` is non-empty, and this provider returns `nil`).
+- **Only Ready nodes are adopted** — `nodeutils.GetCondition(node, NodeReady).Status == True`, the same test Karpenter's own `Initialization` reconciler applies. A NodeClaim for a NotReady node is worse than none at all: it is **counted** (while uninitialized, `StateNode.Capacity()` fills any resource the node does not report from the NodeClaim's — so for a node whose kubelet never reported, or whose Node object is later deleted while the claim lives, the SKU's *declared* figures become the whole capacity and the pool's limits are charged for a machine that is not there), and it is **stuck** — `Initialization` requires `NodeReady`, so the claim sits at `Registered=True` / `Initialized=Unknown("NodeNotReady")` while `Liveness` only reaps claims that failed to *register*, and garbage collection only considers claims absent from `List()` — which this one is not, since adoption just stamped a `rafay://` providerID on its node. Nothing reaps it — not even expiration, since every broker-rendered pool sets `spec.expireAfter: Never`. A machine mid-teardown presents identically, and adopting it writes an **immutable** `spec.providerID` onto an object already on its way out. Waiting costs nothing: the Node watch fires on the status update that flips the condition, so adoption follows within seconds rather than at the next resync. A node that is Ready and *later* goes NotReady keeps its NodeClaim — this gate governs only when to take a node on; from then on Karpenter's **disruption** path owns it (not node repair: that controller is only registered when `RepairPolicies()` is non-empty, and this provider returns `nil`).
 - **The readiness gate is evaluated before the ownership checks**, so that a node still coming up — kubelet registered, but `sku_name` or `spec.providerID` not yet stamped by the platform — gets a quiet `V(2)` deferral rather than recurring warnings, and so the lazy `GetInstanceTypes` resolution (which hard-errors the reconcile on an unusable `RafayNodeClass`) is not hoisted above it. The consequence is that an **already-adopted** node that goes NotReady reaches the gate too, which is why the `notReady` counter excludes nodes whose providerID is already claimed — otherwise the log would report a node as "waiting to become Ready" while the same line said nodes == nodeclaims.
 - **Idempotent through the status gap.** An adopted NodeClaim has an empty `status` until `Launch` runs, so `claimedIDs` is built from the adoption annotation *as well as* `status.providerID`. Reading only the status would let a second pass adopt the same node again — two NodeClaims for one machine, the second of which Karpenter eventually terminates, taking the node with it. NodeClaims are read through `apiReader` for the same reason: a just-created NodeClaim is not in the informer cache yet.
 - **Never steals a pending NodeClaim's node.** `claimedByPendingClaim` is the mirror of the [`NodeProviderIDController`](#pkgcontrollersnodeproviderid--providerid-resolution-controller) rule: that controller binds a node to a pending NodeClaim only when the node is *newer* than the claim, so a node newer than any pending claim for the same pool+SKU is that claim's to take. Adopting it would leave the claim unresolved until its 60-minute registration timeout.
@@ -600,7 +600,7 @@ The marker is an **annotation on the object at creation time**, not a status pre
 - **Control-plane nodes are refused** even if they carry a `nodepoolname` label: a NodeClaim would let Karpenter drain and remove the cluster's own control plane.
 - **`spec.providerID` is filled in only when empty.** Kubernetes makes the field immutable once set, which is also why a wrong value would be unrecoverable — `rafay.BuildProviderID` renders exactly the format the platform itself writes (`rafay://<nodepoolname>/<sku_name>/<hostname>`, see [§10](#10-provider-id-format)).
 - **`karpenter.sh/registered=true` is pre-set on the node.** The `Registration` reconciler logs a registration error and emits an event for any node carrying neither that label nor the `karpenter.sh/unregistered` startup taint. An already-joined node genuinely is registered, and the taint is not an option — it is `NoExecute` and would evict the pods already there.
-- **`spec.expireAfter` comes from the pool template**, exactly as for a NodeClaim Karpenter provisions — so an adopted node is eventually rotated on the pool's own expiry policy (the CRD default is `720h` when the template sets none). Diverging here would make adopted and provisioned nodes in the same pool age differently.
+- **`spec.expireAfter` comes from the pool template**, exactly as for a NodeClaim Karpenter provisions — so an adopted node follows the pool's own expiry policy. Every broker-rendered pool sets `Never` (see [§7.1](#71-catalog--rafaynodeclass-bootstrap)), so in practice neither adopted nor provisioned nodes are ever force-expired; a hand-written pool that sets a duration rotates both alike. Diverging here would make adopted and provisioned nodes in the same pool age differently.
 - **Disabled with `KARPENTER_ADOPT_EXISTING_NODES=false`.** Adoption means Karpenter may consolidate a pre-existing node once it is empty. That is the point — the pool becomes Karpenter's to size — but it is a real behaviour change for a cluster whose nodes were previously untouchable.
 
 ---
@@ -639,6 +639,16 @@ Maintains one Deployment of low-priority pause pods per configured Karpenter Nod
 > **Requires `consolidationPolicy: WhenEmpty`** on participating NodePools. Pause pods keep nodes non-empty by design; with `WhenEmptyOrUnderutilized` Karpenter would repeatedly consolidate nodes that hold only headroom pods, causing churn. The examples in `examples/nodepool.yaml` are set accordingly.
 
 ---
+
+### `pkg/controllers/batchresume` — Add-Batch Resume on Restart
+
+Hands the status poller back the add batches a previous incarnation of the provider sent. The `NodeBatcher` tracks sent batches only in memory, and for adds nothing ever re-sends: once the broker ACKs, the NodeClaim is `Launched` and Karpenter's launch reconciler never calls `Create()` again. A node that does arrive is still bound by the [`NodeProviderIDController`](#pkgcontrollersnodeproviderid--providerid-resolution-controller), so success needs no help — but after a restart a **FAILED** add would go unnoticed, and its pending NodeClaim would sit until the 60-minute registration timeout instead of being reaped within a couple of minutes by the batcher's failure handler.
+
+- **`Create()` stamps the batch on the NodeClaim** it returns (`karpenter.rafay.io/batch-id`). `BatchResult.BatchID` is set on every ACK, including the in-flight short-circuit, and Karpenter's `PopulateNodeClaimDetails` merges returned annotations onto the stored object, so the batch ID outlives the process.
+- **One pass at startup**, as a leader-only manager `Runnable` rather than a reconciler: it lists NodeClaims through the uncached `apiReader`, keeps those that are not deleting and still carry a `rafay://pending/` providerID, groups them by the annotation, and calls `NodeBatcher.ResumeAddBatch` per batch. A batch already tracked is left alone, so the pass is idempotent. NodeClaims without the annotation (created by a provider from before it existed) fall back to the registration-timeout path as they always did.
+- **Resumed batches poll immediately** (no initial delay) and their max-age clock restarts from now; the broker's 90-minute batch index is the tighter bound. A batch the broker has forgotten yields empty polls, which the batcher already treats as failure — the right outcome, since that add really is lost.
+- **Removes are not resumed on purpose:** Karpenter re-issues `Delete()` every few seconds with the same deterministic operation ID, so they recover through the normal path.
+- **Errors are logged, never returned:** a failed list must not stop the manager, and the cost of a missed resume is only the slower registration-timeout recovery that existed before.
 
 ## 6. Data Flows
 
@@ -686,7 +696,9 @@ Pod unschedulable
 Karpenter's termination controller (`awaitInstanceTermination`) calls `CloudProvider.Delete()` on **every** reconcile and releases the Node's termination finalizer **only** when `Delete()` returns a `NodeClaimNotFoundError`; anything else requeues in **5 seconds**. `Delete()` must therefore eventually converge on that error, or the NodeClaim and Node stay `Terminating` forever.
 
 ```
-Disruption controller: consolidate / expire NodeClaim
+Disruption controller: consolidate / drift NodeClaim    (expiration is off on every broker-rendered
+                                                          pool — §7.1; only a hand-written pool or a
+                                                          pre-`Never` NodeClaim is still force-expired)
   └─▶ CloudProvider.Delete(nodeClaim)                       [called every ~5s until it converges]
         ├─ If batcher.Succeeded("<uid>-remove"):
         │    └─▶ return NodeClaimNotFoundError  ← THE convergence signal; Karpenter releases
@@ -879,8 +891,7 @@ When **any** row opts in, the broker renders a NodePool for **every** valid row,
 pools. A row without the field — or with it null/false — renders **inert**: identical labels,
 taints, requirements and nodeClassRef, but `spec.limits.nodes: "0"` (the scheduler excludes a
 pool with no remaining node budget, so it can never scale out), a single all-reasons disruption
-budget of `nodes: "0"` (consolidation and drift can never pick its nodes), and
-`template.spec.expireAfter: Never` (no forced expiration from this template). Every rendered
+budget of `nodes: "0"` (consolidation and drift can never pick its nodes). Every rendered
 pool is stamped `karpenter.rafay.io/auto-scaling: "true"|"false"`; the node-adoption controller
 skips pools marked `"false"`, so a disabled pool's nodes never get NodeClaims and Karpenter
 cannot count, drain, or terminate them. There is no cluster-level toggle in this path — the old
@@ -892,9 +903,29 @@ never validated them).
 
 Turning a pool's `autoScaling` **off** now takes effect on the next resync: the server-side
 apply rewrites its NodePool into the inert shape, so scale-out and consolidation stop without
-anyone deleting the object. One caveat: NodeClaims created while the pool was enabled keep their
-originally stamped `expireAfter` (NodeClaim spec is immutable), so such a node can still be
-force-expired at that horizon — and, the pool now being inert, it is not replaced.
+anyone deleting the object.
+
+**Expiration is off for every pool, enabled or inert.** The broker stamps
+`template.spec.expireAfter: Never` on every NodePool it renders. Karpenter's CRD default (`720h`)
+would force-rotate each node 30 days after creation, and on this platform a rotation is a
+catalog decrement followed by an increment with PaaS — not Karpenter — choosing which physical
+machine the decrement retires (§4.2), so age-based expiry would only churn arbitrary healthy
+machines through a ~10-minute reprovision. The catalog has no per-pool expiry knob. One caveat:
+a NodeClaim stamped before the broker rendered `Never` keeps its original `expireAfter`
+(NodeClaim spec is immutable) and is force-expired once at that horizon — and if its pool has
+since gone inert, it is not replaced.
+
+**Rollout effect — a one-time drift roll.** `expireAfter` is part of Karpenter's NodePool drift
+hash (`NodeClaimTemplateSpec.ExpireAfter` carries no `hash:"ignore"` tag: `NodeClaim.spec.expireAfter`
+is immutable, so replacing the node is the only way a new expiry can take effect). The first
+resync after the broker starts rendering `Never` therefore changes each live pool's
+`karpenter.sh/nodepool-hash`, every Karpenter-provisioned NodeClaim in the pool is marked
+`Drifted`, and the disruption controller replaces them under the pool's budget (default 10% of
+nodes at a time), each replacement being a ~10-minute provision followed by a catalog decrement
+whose retired machine PaaS chooses (§4.2). Adopted NodeClaims carry no nodepool-hash annotation
+(§6.6) and are not drifted — until a Karpenter upgrade bumps `karpenter.sh/nodepool-hash-version`,
+whose back-fill stamps them with the then-current hash and makes them subject to later template
+edits like any provisioned claim.
 
 Operational notes: objects carry `karpenter.rafay.io/managed-by=edge-broker` and
 `karpenter.rafay.io/config-revision`; a resync whose revision is unchanged is skipped; nothing is
@@ -1346,9 +1377,17 @@ Proactive capacity is maintained by the headroom controller as one Deployment of
 
 `GetNode` and `ListNodes` return sentinel errors; the provider falls back to listing Kubernetes `Node` objects filtered by `spec.providerID` prefix `rafay://`. The Kubernetes API is the ground truth for what is currently running.
 
-### No drift detection
+### No cloud-provider drift detection
 
-`IsDrifted` always returns `("", nil)`. Node lifecycle is managed entirely by Rafay's control plane.
+`IsDrifted` always returns `("", nil)`: the provider never reports a machine as drifted on its own
+(no image, firmware or instance-metadata comparison), because the physical machine's lifecycle
+belongs to Rafay's control plane. Karpenter core's own drift checks still run — and are evaluated
+*before* `IsDrifted` is consulted: static drift (a `karpenter.sh/nodepool-hash` mismatch, which any
+NodePool template edit triggers, including the `expireAfter` change described in the §7.1 rollout
+note), requirements drift (pool requirements vs NodeClaim labels) and `instanceTypeNotFound` (a SKU
+dropped from the NodeClass). A drifted NodeClaim is replaced by the disruption controller under the
+pool's budget. Adopted NodeClaims carry no nodepool-hash annotation and are exempt from static
+drift (§6.6).
 
 ### Parity with `edge-client`
 
