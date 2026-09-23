@@ -1091,7 +1091,7 @@ See [docs/crash_safety.md](crash_safety.md) for per-step failure analysis.
 
 ### Registration Timeout Window
 
-Karpenter's `registrationTimeout` is **60 minutes** (set in the forked `sigs.k8s.io/karpenter` → `../karpenter`, `pkg/controllers/nodeclaim/lifecycle/liveness.go`) from when `Registered=Unknown` is first set (typically ~1s after `Create()` returns). Nodes join at **~12 minutes**, leaving a wide margin. The 60-minute timer is a **backstop**: broker-reported failures do not wait for it — the status poller's failure handler deletes the pending NodeClaim within roughly one poll interval of the broker writing FAILED.
+Karpenter's `registrationTimeout` is **60 minutes** (set in the Rafay fork of `sigs.k8s.io/karpenter`, `github.com/RafaySystems/karpenter-rafay` branch `rafay-release-v1.14.x`, `pkg/controllers/nodeclaim/lifecycle/liveness.go`) from when `Registered=Unknown` is first set (typically ~1s after `Create()` returns). Nodes join at **~12 minutes**, leaving a wide margin. The 60-minute timer is a **backstop**: broker-reported failures do not wait for it — the status poller's failure handler deletes the pending NodeClaim within roughly one poll interval of the broker writing FAILED.
 
 ```
 t=0       Create() returns at broker ACK → Launched=True, synthetic ProviderID in etcd
@@ -1272,10 +1272,10 @@ data:
 
 | Module | Version | Role |
 |--------|---------|------|
-| `sigs.k8s.io/karpenter` | v1.11.1, **replace → local fork `../karpenter`** | Core framework: operator, controllers, `CloudProvider` interface. The fork raises `registrationTimeout` to 60 min (`liveness.go`). |
+| `sigs.k8s.io/karpenter` | v1.14.1, **replace → fork `github.com/RafaySystems/karpenter-rafay`** (branch `rafay-release-v1.14.x`, pinned by commit pseudo-version) | Core framework: operator, controllers, `CloudProvider` interface. The fork raises `registrationTimeout` to 60 min (`liveness.go`). |
 | `sigs.k8s.io/controller-runtime` | v0.23.3 | Reconciler infrastructure, Manager, typed client |
 | `github.com/awslabs/operatorpkg` | (see go.mod) | Operator lifecycle, `status.Condition`, `controller.Controller` |
-| `github.com/RafaySystems/edge-common` | replace → local | `rep.edge.v1` Karpenter batch protos (add/remove/poll/cancel) and generated Go |
+| `github.com/RafaySystems/edge-common` | pinned commit pseudo-version in `go.mod` (same commit as `edge-broker/go.mod`; fetched from GitHub at build time) | `rep.edge.v1` Karpenter batch protos (add/remove/poll/cancel) and generated Go |
 | `google.golang.org/grpc` | v1.72.2 | gRPC client (`grpc.NewClient`, lazy connect) |
 | `google.golang.org/protobuf` | v1.36.11 | Protobuf serialization |
 | `k8s.io/client-go` | v0.35.1 | Kubernetes client |

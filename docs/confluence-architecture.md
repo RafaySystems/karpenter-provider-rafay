@@ -816,7 +816,7 @@ Deleting a NodeClaim whose node never joined fires `Cancel(UID)`: a fire-and-for
 | Batch: empty polls before declaring batch unknown | `maxConsecutiveEmptyPolls` | 3 | `pkg/rafay/batcher.go` |
 | Batch: how long a SUCCEEDED operationID is remembered (drives `Delete()` convergence) | `succeededRetention` | 2 h | `pkg/rafay/batcher.go` |
 | Cancel: fire-and-forget broker cancel deadline | `cancelTimeout` | 10 s | `pkg/rafay/batcher.go` |
-| Karpenter: `Delete()` retry interval while a node is terminating | `awaitInstanceTermination` requeue | 5 s | `../karpenter/pkg/controllers/node/termination/controller.go` |
+| Karpenter: `Delete()` retry interval while a node is terminating | `awaitInstanceTermination` requeue | 5 s | Karpenter core `pkg/controllers/node/termination/controller.go` |
 | Broker: ACCEPTED record TTL | `karpenterBatchAcceptedTTL` | 15 min | `pkg/context/karpenter_batch_stream.go` |
 | Broker: RUNNING / FAILED record TTL | `karpenterBatchRunningTTL` | 60 min | `pkg/context/karpenter_batch_stream.go` |
 | Broker: SUCCEEDED tombstone TTL (refreshed on re-send) | `karpenterBatchSucceededTTL` | **24 h** | `pkg/context/karpenter_batch_stream.go` |
@@ -825,7 +825,7 @@ Deleting a NodeClaim whose node never joined fires `Cancel(UID)`: a fire-and-for
 | NodeProviderIDController: requeue when no node | `nodeWaitRequeueTime` | 30 s | `pkg/controllers/nodeproviderid/controller.go` |
 | Headroom: safety resync | `resyncInterval` | 5 min | `pkg/controllers/headroom/controller.go` |
 | NodeClaim launch timeout | `launchTimeout` | 5 min | Karpenter upstream (fork) |
-| NodeClaim registration timeout | `registrationTimeout` | **60 min** (patched from 15 min) | `../karpenter/pkg/controllers/nodeclaim/lifecycle/liveness.go` |
+| NodeClaim registration timeout | `registrationTimeout` | **60 min** (patched from 15 min) | Karpenter core `pkg/controllers/nodeclaim/lifecycle/liveness.go` |
 | gRPC keepalive ping | `ClientParameters.Time` | 5 min | `pkg/broker/conn.go` |
 | gRPC keepalive timeout | `ClientParameters.Timeout` | 30 s | `pkg/broker/conn.go` |
 | gRPC keepalive without streams | `PermitWithoutStream` | false | `pkg/broker/conn.go` |
@@ -936,7 +936,7 @@ The readiness controller validates every entry (non-empty name, parseable `cpu`/
 
 | Module | Version | Role |
 |---|---|---|
-| `sigs.k8s.io/karpenter` | v1.11.1 (local fork) | Core framework: operator, controllers, `CloudProvider` interface. Forked to patch `registrationTimeout` to 60 min. |
+| `sigs.k8s.io/karpenter` | v1.14.1 (Rafay fork `github.com/RafaySystems/karpenter-rafay`, branch `rafay-release-v1.14.x`) | Core framework: operator, controllers, `CloudProvider` interface. Forked to patch `registrationTimeout` to 60 min. |
 | `sigs.k8s.io/controller-runtime` | v0.23.3 | Reconciler infrastructure, Manager, typed client |
 | `github.com/awslabs/operatorpkg` | (see go.mod) | Operator lifecycle, `status.Condition`, `controller.Controller` |
 | `github.com/RafaySystems/edge-common` | replace → local | `rep.edge.v1` Karpenter batch protocol (add / remove / status / cancel) and generated Go |

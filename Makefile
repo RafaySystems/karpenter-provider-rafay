@@ -1,9 +1,6 @@
 IMG ?= karpenter-provider-rafay:latest
 LDFLAGS := "-X google.golang.org/protobuf/reflect/protoregistry.conflictPolicy=warn"
 
-# go.mod replace: ../edge-common — pass --build-context edgecommon=$(EDGE_COMMON_DIR)
-EDGE_COMMON_DIR ?= ../edge-common
-
 DEV_USER ?= ${USER}
 DEV_TAG := registry.dev.rafay-edge.net/${DEV_USER}/karpenter-provider-rafay:$(shell git branch --show-current | tr "/" "-")-$(shell /bin/date "+%Y%m%d-%H%M")
 
@@ -23,12 +20,10 @@ tag-dev:
 
 .PHONY: build
 build:
-	@test -d "$(EDGE_COMMON_DIR)" || (echo "edge-common not found at $(EDGE_COMMON_DIR); set EDGE_COMMON_DIR" >&2; exit 1)
 	DOCKER_BUILDKIT=1 docker build . -t ${IMG} --pull \
 		--build-arg LDFLAGS=$(LDFLAGS) \
 		--build-arg BUILD_USR=${BUILD_USER} \
-		--build-arg BUILD_PWD=${BUILD_PASSWORD} \
-		--build-context edgecommon=$(EDGE_COMMON_DIR)
+		--build-arg BUILD_PWD=${BUILD_PASSWORD}
 
 .PHONY: push
 push: build tag-dev push-it
@@ -93,12 +88,10 @@ docker-build-amd64: build
 
 .PHONY: docker-build-arm64
 docker-build-arm64:
-	@test -d "$(EDGE_COMMON_DIR)" || (echo "edge-common not found at $(EDGE_COMMON_DIR)" >&2; exit 1)
 	DOCKER_BUILDKIT=1 docker build . -t ${IMG} --pull --platform linux/arm64 \
 		--build-arg LDFLAGS=$(LDFLAGS) \
 		--build-arg BUILD_USR=${BUILD_USER} \
-		--build-arg BUILD_PWD=${BUILD_PASSWORD} \
-		--build-context edgecommon=$(EDGE_COMMON_DIR)
+		--build-arg BUILD_PWD=${BUILD_PASSWORD}
 
 .PHONY: install-crds
 install-crds:
