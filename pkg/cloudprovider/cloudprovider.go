@@ -35,6 +35,7 @@ import (
 	"github.com/RafaySystems/karpenter-provider-rafay/pkg/rafay"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
 )
@@ -259,8 +260,14 @@ func (c *CloudProvider) Delete(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 			return result.Err
 		}
 		// Queued at the broker. Return nil so Karpenter requeues and calls Delete again; once the
-		// poller sees the operation SUCCEEDED, the call above reports the instance gone.
-		klog.Infof("Delete: broker ACK for nodeclaim=%s providerID=%s — awaiting removal", nodeClaim.Name, providerID)
+		// poller sees the operation SUCCEEDED, the call above reports the instance gone. Only
+		// the first ACK is worth a line: the 5-second re-invocations that follow are resolved
+		// from the in-flight set without a send (a 15-minute retire is ~180 of them).
+		if result.Duplicate {
+			klog.V(2).Infof("Delete: removal already in flight for nodeclaim=%s providerID=%s — awaiting removal", nodeClaim.Name, providerID)
+		} else {
+			klog.Infof("Delete: broker ACK for nodeclaim=%s providerID=%s — awaiting removal", nodeClaim.Name, providerID)
+		}
 		return nil
 	}
 }
@@ -451,6 +458,31 @@ func (c *CloudProvider) GetInstanceTypes(ctx context.Context, nodePool *karpv1.N
 		klog.V(2).Infof("GetInstanceTypes: pool %q is at its platform maximum; offerings unavailable until %s", nodePool.Name, until.Format(time.RFC3339))
 	}
 	return its, nil
+}
+
+// PoolAtMaxEventReason is the reason of the Warning event the batch failure handler records on
+// a NodePool the broker reported at its platform maximum, so `kubectl describe nodepool` (and
+// anything watching events) explains why the pool's pods stay pending during the hold.
+const PoolAtMaxEventReason = "PoolAtPlatformMaximum"
+
+// publishPoolAtMaxEvent records the hold on the NodePool object. Best effort: a pool that
+// cannot be read (renamed, deleted, or the config sync has not applied it yet) gets no event.
+func publishPoolAtMaxEvent(ctx context.Context, reader client.Reader, recorder events.Recorder, pool, detail string, until time.Time) {
+	if recorder == nil || reader == nil || pool == "" {
+		return
+	}
+	var np karpv1.NodePool
+	if err := reader.Get(ctx, client.ObjectKey{Name: pool}, &np); err != nil {
+		klog.V(2).Infof("pool %q at platform maximum: no event recorded, get NodePool: %v", pool, err)
+		return
+	}
+	recorder.Publish(events.Event{
+		InvolvedObject: &np,
+		Type:           corev1.EventTypeWarning,
+		Reason:         PoolAtMaxEventReason,
+		Message:        fmt.Sprintf("The platform refused a node for this pool (%s); not provisioning into it until %s", detail, until.Format(time.RFC3339)),
+		DedupeValues:   []string{pool},
+	})
 }
 
 // nodeClaimResources returns the instance type resource list as it is reported on a NodeClaim's
@@ -677,8 +709,11 @@ func filterCompatibleInstanceTypes(instanceTypes []*cloudprovider.InstanceType, 
 // then withholds the pool's offerings for the cooldown and Karpenter leaves the pods pending
 // instead of re-asking every few minutes. The NodeClaim is still deleted — kept, it would be an
 // in-flight node the scheduler expects the pods to land on, for the full 60-minute registration
-// timeout. A nil poolBackoff keeps the plain delete-and-reprovision behaviour.
-func NewBatchFailureHandler(kubeClient client.Client, apiReader client.Reader, poolBackoff *PoolBackoff) rafay.FailureHandler {
+// timeout. A nil poolBackoff keeps the plain delete-and-reprovision behaviour. The hold is also
+// published as a Warning event on the NodePool (PoolAtMaxEventReason) when recorder is non-nil:
+// the pods' own scheduling message during the hold ("nodepool requirements filtered out all
+// available instance types") does not say why.
+func NewBatchFailureHandler(kubeClient client.Client, apiReader client.Reader, poolBackoff *PoolBackoff, recorder events.Recorder) rafay.FailureHandler {
 	return func(ctx context.Context, operationID, kind, detail string) {
 		if kind != "add" {
 			klog.Warningf("batch %s operation failed operationID=%s: %s", kind, operationID, detail)
@@ -705,6 +740,7 @@ func NewBatchFailureHandler(kubeClient client.Client, apiReader client.Reader, p
 				pool := nc.Labels[karpv1.NodePoolLabelKey]
 				if until := poolBackoff.Mark(pool); !until.IsZero() {
 					klog.Warningf("batch add failed operationID=%s (%s): pool %q is at its platform maximum; holding back provisioning for it until %s", operationID, detail, pool, until.Format(time.RFC3339))
+					publishPoolAtMaxEvent(ctx, apiReader, recorder, pool, detail, until)
 				}
 			}
 			klog.Warningf("batch add failed operationID=%s (%s): deleting nodeclaim %s so Karpenter reprovisions immediately", operationID, detail, nc.Name)

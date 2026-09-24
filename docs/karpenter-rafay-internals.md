@@ -165,8 +165,8 @@ pending ProviderID and has no deletion timestamp — so a failed provision is re
 instead of waiting out the 60-minute registration timeout (§2). A `pool at maximum` detail (the
 broker refused the node because the pool is at its platform maximum) is the exception that must
 not be retried at once: the handler first holds the NodePool back in a `PoolBackoff`
-(`RAFAY_POOL_AT_MAX_COOLDOWN`, default 5 min) so `GetInstanceTypes` withholds its offerings, then
-deletes the NodeClaim as usual. **Remove** failures are logged only: Karpenter retries `Delete()`
+(`RAFAY_POOL_AT_MAX_COOLDOWN`, default 5 min) so `GetInstanceTypes` withholds its offerings, records
+a `PoolAtPlatformMaximum` Warning event on the NodePool, then deletes the NodeClaim as usual. **Remove** failures are logged only: Karpenter retries `Delete()`
 as long as the node object exists.
 
 **Cancellation:** `Cancel(operationID)` sends a fire-and-forget `cancel_ops` to the broker

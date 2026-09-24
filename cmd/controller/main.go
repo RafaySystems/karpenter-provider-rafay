@@ -166,7 +166,7 @@ func main() {
 	// FAILED add operations delete the matching pending NodeClaim so Karpenter reprovisions
 	// immediately (a "pool at maximum" refusal also holds the pool back first); must be
 	// registered before the batcher starts polling.
-	rafayClient.Batcher().SetFailureHandler(cloudprovider.NewBatchFailureHandler(op.GetClient(), op.Manager.GetAPIReader(), poolBackoff))
+	rafayClient.Batcher().SetFailureHandler(cloudprovider.NewBatchFailureHandler(op.GetClient(), op.Manager.GetAPIReader(), poolBackoff, op.EventRecorder))
 	// Start the batch sender + status poller goroutines; they run until ctx is cancelled.
 	rafayClient.StartBatcher(ctx)
 

@@ -114,7 +114,11 @@ type BatchResult struct {
 	// including the in-flight short-circuit, so a caller can persist it — Create() stamps it on
 	// the NodeClaim, which is what lets a restarted provider resume polling (see ResumeAddBatch).
 	BatchID string
-	Err     error
+	// Duplicate is set when the operation was already in flight at the broker and the caller
+	// was resolved without a new send — Karpenter re-invokes Delete every ~5 s for the life of
+	// a removal, so most results are duplicates. Lets callers log the first ACK and not the rest.
+	Duplicate bool
+	Err       error
 }
 
 // FailureHandler is invoked by the status poller when the broker reports a terminal FAILED
@@ -290,7 +294,7 @@ func (b *NodeBatcher) enqueueItem(item batchItem) <-chan BatchResult {
 	b.mu.Unlock()
 	if inFlight {
 		klog.V(4).Infof("batcher: operationID=%s already in flight at broker — not re-sending", item.operationID)
-		ch <- BatchResult{BatchID: batchID}
+		ch <- BatchResult{BatchID: batchID, Duplicate: true}
 		return ch
 	}
 

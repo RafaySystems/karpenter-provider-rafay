@@ -30,6 +30,7 @@ import (
 	karpapis "sigs.k8s.io/karpenter/pkg/apis"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	karpcp "sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
 )
 
@@ -353,7 +354,7 @@ func newFailureHandlerScheme(t *testing.T) *runtime.Scheme {
 		t.Fatalf("add client-go scheme: %v", err)
 	}
 	gv := schema.GroupVersion{Group: karpapis.Group, Version: "v1"}
-	s.AddKnownTypes(gv, &karpv1.NodeClaim{}, &karpv1.NodeClaimList{})
+	s.AddKnownTypes(gv, &karpv1.NodeClaim{}, &karpv1.NodeClaimList{}, &karpv1.NodePool{}, &karpv1.NodePoolList{})
 	metav1.AddToGroupVersion(s, gv)
 	if err := v1alpha1.AddToScheme(s); err != nil {
 		t.Fatalf("add v1alpha1 scheme: %v", err)
@@ -398,7 +399,7 @@ func nodeClaimExists(t *testing.T, c client.Client, name string) bool {
 func TestBatchFailureHandlerDeletesPendingClaim(t *testing.T) {
 	claim := newNodeClaim("pending-claim", "op-1", PendingProviderIDPrefix+"op-1")
 	cl := newFakeClientWithClaims(t, claim)
-	handler := NewBatchFailureHandler(cl, cl, nil)
+	handler := NewBatchFailureHandler(cl, cl, nil, nil)
 
 	handler(context.Background(), "op-1", "add", "node provisioning failed")
 
@@ -410,7 +411,7 @@ func TestBatchFailureHandlerDeletesPendingClaim(t *testing.T) {
 func TestBatchFailureHandlerKeepsResolvedClaim(t *testing.T) {
 	claim := newNodeClaim("resolved-claim", "op-2", "rafay://cluster-1/node-1")
 	cl := newFakeClientWithClaims(t, claim)
-	handler := NewBatchFailureHandler(cl, cl, nil)
+	handler := NewBatchFailureHandler(cl, cl, nil, nil)
 
 	handler(context.Background(), "op-2", "add", "late failure after node joined")
 
@@ -422,7 +423,7 @@ func TestBatchFailureHandlerKeepsResolvedClaim(t *testing.T) {
 func TestBatchFailureHandlerIgnoresRemoveFailures(t *testing.T) {
 	claim := newNodeClaim("pending-claim", "op-3", PendingProviderIDPrefix+"op-3")
 	cl := newFakeClientWithClaims(t, claim)
-	handler := NewBatchFailureHandler(cl, cl, nil)
+	handler := NewBatchFailureHandler(cl, cl, nil, nil)
 
 	// Even with a matching UID and a pending ProviderID, kind "remove" never deletes.
 	handler(context.Background(), "op-3", "remove", "remove failed")
@@ -435,7 +436,7 @@ func TestBatchFailureHandlerIgnoresRemoveFailures(t *testing.T) {
 func TestBatchFailureHandlerMissingClaimIsNoop(t *testing.T) {
 	other := newNodeClaim("other-claim", "other-uid", PendingProviderIDPrefix+"other-uid")
 	cl := newFakeClientWithClaims(t, other)
-	handler := NewBatchFailureHandler(cl, cl, nil)
+	handler := NewBatchFailureHandler(cl, cl, nil, nil)
 
 	// No NodeClaim matches this operationID; the handler must not panic or touch other claims.
 	handler(context.Background(), "no-such-op", "add", "failure for unknown claim")
@@ -610,11 +611,19 @@ func newPoolClaim(name, uid, providerID, pool string) *karpv1.NodeClaim {
 	return nc
 }
 
+// capturingRecorder collects the events the failure handler publishes.
+type capturingRecorder struct{ events []events.Event }
+
+func (r *capturingRecorder) Publish(evts ...events.Event) { r.events = append(r.events, evts...) }
+
 func TestBatchFailureHandlerPoolAtMaxHoldsPoolAndDeletesClaim(t *testing.T) {
 	claim := newPoolClaim("pending-claim", "op-max", PendingProviderIDPrefix+"op-max", "pool1")
-	cl := newFakeClientWithClaims(t, claim)
+	np := &karpv1.NodePool{}
+	np.Name = "pool1"
+	cl := fake.NewClientBuilder().WithScheme(newFailureHandlerScheme(t)).WithObjects(claim, np).Build()
+	rec := &capturingRecorder{}
 	backoff := NewPoolBackoff(5 * time.Minute)
-	handler := NewBatchFailureHandler(cl, cl, backoff)
+	handler := NewBatchFailureHandler(cl, cl, backoff, rec)
 
 	handler(context.Background(), "op-max", "add", `batch add: pool at maximum: pool "pool1" has 3 of max 4 nodes; 2 requested, 1 refused`)
 
@@ -628,6 +637,41 @@ func TestBatchFailureHandlerPoolAtMaxHoldsPoolAndDeletesClaim(t *testing.T) {
 	if remaining := time.Until(until); remaining <= 4*time.Minute || remaining > 5*time.Minute {
 		t.Errorf("hold ends in %s, want ~5m", remaining)
 	}
+	if len(rec.events) != 1 {
+		t.Fatalf("want one Warning event on the NodePool, got %d", len(rec.events))
+	}
+	ev := rec.events[0]
+	if ev.Reason != PoolAtMaxEventReason || ev.Type != corev1.EventTypeWarning {
+		t.Errorf("event = %s/%s, want %s/%s", ev.Type, ev.Reason, corev1.EventTypeWarning, PoolAtMaxEventReason)
+	}
+	if got, ok := ev.InvolvedObject.(*karpv1.NodePool); !ok || got.Name != "pool1" {
+		t.Errorf("event involved object = %T %v, want NodePool pool1", ev.InvolvedObject, ev.InvolvedObject)
+	}
+	if !strings.Contains(ev.Message, "pool at maximum") || !strings.Contains(ev.Message, "not provisioning into it until") {
+		t.Errorf("event message = %q", ev.Message)
+	}
+}
+
+// No NodePool object (config sync has not applied it, or it was renamed) means no event, and
+// nothing else changes.
+func TestBatchFailureHandlerPoolAtMaxWithoutNodePoolObjectStillHolds(t *testing.T) {
+	claim := newPoolClaim("pending-claim", "op-max2", PendingProviderIDPrefix+"op-max2", "pool-missing")
+	cl := newFakeClientWithClaims(t, claim)
+	rec := &capturingRecorder{}
+	backoff := NewPoolBackoff(5 * time.Minute)
+	handler := NewBatchFailureHandler(cl, cl, backoff, rec)
+
+	handler(context.Background(), "op-max2", "add", "pool at maximum")
+
+	if nodeClaimExists(t, cl, "pending-claim") {
+		t.Fatal("NodeClaim must still be deleted")
+	}
+	if _, held := backoff.Until("pool-missing"); !held {
+		t.Fatal("pool must still be held")
+	}
+	if len(rec.events) != 0 {
+		t.Errorf("no NodePool object, so no event; got %d", len(rec.events))
+	}
 }
 
 // The wording brokers used before partial acceptance still counts as the same refusal.
@@ -635,7 +679,7 @@ func TestBatchFailureHandlerLegacyAtMaxWordingHoldsPool(t *testing.T) {
 	claim := newPoolClaim("pending-claim", "op-old", PendingProviderIDPrefix+"op-old", "pool1")
 	cl := newFakeClientWithClaims(t, claim)
 	backoff := NewPoolBackoff(5 * time.Minute)
-	handler := NewBatchFailureHandler(cl, cl, backoff)
+	handler := NewBatchFailureHandler(cl, cl, backoff, nil)
 
 	handler(context.Background(), "op-old", "add", `batch add: pool "pool1" is at its maximum: 3 + 2 would exceed max 4`)
 
@@ -648,7 +692,7 @@ func TestBatchFailureHandlerOtherFailuresDoNotHoldPool(t *testing.T) {
 	claim := newPoolClaim("pending-claim", "op-err", PendingProviderIDPrefix+"op-err", "pool1")
 	cl := newFakeClientWithClaims(t, claim)
 	backoff := NewPoolBackoff(5 * time.Minute)
-	handler := NewBatchFailureHandler(cl, cl, backoff)
+	handler := NewBatchFailureHandler(cl, cl, backoff, nil)
 
 	handler(context.Background(), "op-err", "add", "batch add: ApplyCluster: still conflicting after 3 attempts")
 
@@ -663,7 +707,7 @@ func TestBatchFailureHandlerOtherFailuresDoNotHoldPool(t *testing.T) {
 func TestBatchFailureHandlerNilBackoffStillDeletes(t *testing.T) {
 	claim := newPoolClaim("pending-claim", "op-nil", PendingProviderIDPrefix+"op-nil", "pool1")
 	cl := newFakeClientWithClaims(t, claim)
-	handler := NewBatchFailureHandler(cl, cl, nil)
+	handler := NewBatchFailureHandler(cl, cl, nil, nil)
 
 	handler(context.Background(), "op-nil", "add", "pool at maximum")
 
