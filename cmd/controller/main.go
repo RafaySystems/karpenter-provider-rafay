@@ -20,6 +20,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	_ "github.com/RafaySystems/karpenter-provider-rafay/pkg/operator"
 
@@ -53,6 +54,21 @@ func envPortOrDefault(name string, def int) int {
 	v, err := strconv.Atoi(p)
 	if err != nil {
 		klog.Warningf("invalid %s=%q, using default %d", name, p, def)
+		return def
+	}
+	return v
+}
+
+// envDurationOrDefault parses the named environment variable as a Go duration ("5m", "90s").
+// Unset returns def; an invalid value logs a warning and keeps the default.
+func envDurationOrDefault(name string, def time.Duration) time.Duration {
+	p := strings.TrimSpace(os.Getenv(name))
+	if p == "" {
+		return def
+	}
+	v, err := time.ParseDuration(p)
+	if err != nil {
+		klog.Warningf("invalid %s=%q, using default %s", name, p, def)
 		return def
 	}
 	return v
@@ -143,13 +159,18 @@ func main() {
 		klog.Warning("EDGE_BROKER_GRPC_INSECURE=true: edge-broker typically requires mTLS so it can read the client certificate (NO CLIENT ID if the peer cert is missing)")
 	}
 	rafayClient := rafay.NewBrokerClient(certPath, keyPath, caPath, port, edgeID, streamID, dialHost, grpcInsecure)
+	// Pools the broker reports at their platform maximum are held back from provisioning for
+	// this long (0 disables the hold). Shared between the failure handler, which marks pools,
+	// and the cloud provider, which withholds their offerings.
+	poolBackoff := cloudprovider.NewPoolBackoff(envDurationOrDefault("RAFAY_POOL_AT_MAX_COOLDOWN", cloudprovider.DefaultPoolAtMaxCooldown))
 	// FAILED add operations delete the matching pending NodeClaim so Karpenter reprovisions
-	// immediately; must be registered before the batcher starts polling.
-	rafayClient.Batcher().SetFailureHandler(cloudprovider.NewBatchFailureHandler(op.GetClient(), op.Manager.GetAPIReader()))
+	// immediately (a "pool at maximum" refusal also holds the pool back first); must be
+	// registered before the batcher starts polling.
+	rafayClient.Batcher().SetFailureHandler(cloudprovider.NewBatchFailureHandler(op.GetClient(), op.Manager.GetAPIReader(), poolBackoff, op.EventRecorder))
 	// Start the batch sender + status poller goroutines; they run until ctx is cancelled.
 	rafayClient.StartBatcher(ctx)
 
-	cp := cloudprovider.NewCloudProvider(op.GetClient(), op.Manager.GetAPIReader(), rafayClient, clusterID, projectID, rafayClient.Batcher())
+	cp := cloudprovider.NewCloudProvider(op.GetClient(), op.Manager.GetAPIReader(), rafayClient, clusterID, projectID, rafayClient.Batcher(), poolBackoff)
 	cloudProvider := metrics.Decorate(cp)
 	clusterState := state.NewCluster(op.Clock, op.GetClient(), cloudProvider)
 

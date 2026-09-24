@@ -42,7 +42,7 @@
 | **Removal granularity** | Catalog **count decrement** per pool+SKU — the PaaS platform chooses which physical machine is removed (`provider_id` is carried for a future targeted-removal API) |
 | **ProviderID resolution** | `NodeProviderIDController` patches real `spec.providerID` once the node joins the cluster |
 | **Pre-existing nodes** | `NodeAdoptionController` creates a NodeClaim per unclaimed worker node in a pool (no broker call), so the pool's original nodes count towards its limits and can be consolidated |
-| **Failure recovery** | Status poller reports broker-side FAILED ops to a failure handler that deletes the still-pending NodeClaim, so Karpenter reprovisions in seconds instead of waiting out the 60-min registration timeout |
+| **Failure recovery** | Status poller reports broker-side FAILED ops to a failure handler that deletes the still-pending NodeClaim, so Karpenter reprovisions in seconds instead of waiting out the 60-min registration timeout. A `pool at maximum` refusal additionally holds the NodePool back for a cooldown (default 5 min) so Karpenter does not re-ask at once |
 | **Removal completion** | Status poller records broker-side SUCCEEDED ops; `Delete()` returns `NodeClaimNotFoundError` once the remove op has SUCCEEDED — the only signal that releases the Node's termination finalizer |
 | **Source of truth** | NodeClaims in etcd — no in-memory state is load-bearing across pod restarts |
 
@@ -974,6 +974,8 @@ Deleting a NodeClaim whose node never joined used to have no safe remedy. Now th
 ### FAILED provisions delete the pending NodeClaim
 
 The status poller hands terminal FAILED results to a `FailureHandler`. For adds, the wired handler deletes the NodeClaim whose UID matches the operationID — only if it still carries a pending ProviderID and is not already being deleted — so Karpenter reprovisions within seconds instead of waiting out the 60-minute registration timeout. Remove failures are log-only: the operationID is cleared from the in-flight set, and Karpenter's ongoing `Delete()` retries re-send the removal (the broker rewrites the FAILED record to ACCEPTED).
+
+One add failure is deliberately not retried at once. When the broker's detail starts `pool at maximum` — it refused the node because the pool is already at its platform maximum — the handler first marks the NodePool in a shared `PoolBackoff`; `GetInstanceTypes` then reports the pool's offerings unavailable for the cooldown (`RAFAY_POOL_AT_MAX_COOLDOWN`, default 5 min), so the scheduler leaves the pods pending rather than creating a NodeClaim the broker would refuse again; the hold is recorded as a `PoolAtPlatformMaximum` Warning event on the NodePool. Every instance type also advertises `nodes: 1` in its capacity, so `NodePool.spec.limits.nodes` holds within a scheduling round and Karpenter does not over-ask in the first place; the broker, for its part, applies the part of a batch that fits and refuses only the overflow. Details in `docs/architecture.md`, "Pool maximum: three layers".
 
 SUCCEEDED results are **recorded**, not merely logged. For adds that is incidental — registration is driven by the node joining. For **removes** it is the convergence signal: it is what lets `Delete()` return `NodeClaimNotFoundError` and release the Node's termination finalizer.
 

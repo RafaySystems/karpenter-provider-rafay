@@ -4,7 +4,8 @@
 > design is current, but the client-side `resultCh` flow has since changed. `Create()` is now
 > unblocked by the broker **ACK** (`KarpenterBatchAccepted`), not by a SUCCEEDED status poll, and
 > terminal FAILED results are fed back through a `FailureHandler` that deletes the still-pending
-> NodeClaim so Karpenter reprovisions immediately. The batcher also handles node **removal** and
+> NodeClaim so Karpenter reprovisions immediately (a `pool at maximum` refusal also holds the
+> NodePool back for a cooldown first). The batcher also handles node **removal** and
 > **cancellation** — see [batch-node-removal.md](batch-node-removal.md). For the current batcher
 > behavior see [karpenter-rafay-internals.md §4](../karpenter-rafay-internals.md#4-nodebatcher-batch-send-architecture).
 
@@ -137,8 +138,10 @@ internal plaintext listener (port 5449).
   `inFlight` (`resultCh` was already resolved at broker ACK; for an **add** this is not on the
   registration critical path — the node joining is — but for a **remove** it is what lets `Delete()`
   converge, see [batch-node-removal.md](batch-node-removal.md#delete-must-converge--and-node-existence-cannot-be-how));
-  FAILED → invoke the registered `FailureHandler` (which deletes the still-pending NodeClaim) and
-  clear `inFlight` so a retry can re-send; ACCEPTED/RUNNING → leave in the pending list.
+  FAILED → invoke the registered `FailureHandler` (which deletes the still-pending NodeClaim, and
+  for a `pool at maximum` detail first holds the NodePool back — see `docs/architecture.md`,
+  "Pool maximum: three layers") and clear `inFlight` so a retry can re-send; ACCEPTED/RUNNING →
+  leave in the pending list.
 - Removes fully resolved batches from `inProgress`. Batches older than `maxBatchAge` (2 h), or
   unknown at the broker (3 consecutive empty status responses), are dropped with every remaining
   item treated as FAILED (`"batch expired at broker"`).
