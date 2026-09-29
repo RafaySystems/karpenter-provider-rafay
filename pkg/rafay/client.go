@@ -51,13 +51,20 @@ type RemoveNodesRequest struct {
 	InstanceType string
 	// NodePoolName identifies the node pool the node belongs to.
 	NodePoolName string
-	// ProviderID identifies the node to remove (e.g. rafay://cluster/node-id).
+	// ProviderID identifies the node to remove, in the platform's format
+	// rafay://<nodepoolname>/<sku_name>/<hostname> (see ParseProviderID — the first segment is the
+	// node pool, never a cluster ID). Empty when the machine has not registered yet (the add
+	// succeeded but no Node carries an ID): the removal is then untargeted. Brokers so far ignore
+	// it and let the catalog decide which machine is retired.
 	ProviderID string
 }
 
 // NodeInfo describes a node known to Rafay (for Get/List).
 type NodeInfo struct {
 	ProviderID string
-	// Capacity can be set from Rafay if known; otherwise filled from instance type.
+	// Capacity is the node's reported capacity, as resource.Quantity strings keyed by resource
+	// name. The broker client has no node API, so CloudProvider fills it from the Kubernetes
+	// Node's status.capacity (kubeNodeToNodeInfo); nothing falls back to the instance type — a
+	// NodeInfo with no capacity yields a NodeClaim with an empty status.capacity.
 	Capacity map[string]string
 }

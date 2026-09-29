@@ -20,8 +20,9 @@ limitations under the License.
 // Flow:
 //  1. CloudProvider.Create() returns immediately after broker ACK with ProviderID = "rafay://pending/<uid>".
 //  2. This controller watches NodeClaims and Nodes.
-//  3. When a node with matching nodepoolname+sku_name labels appears, it patches the NodeClaim's
-//     Status.ProviderID to the real node ProviderID (see cprovider.NodeClaimSKUs for how sku_name is matched).
+//  3. When a node with matching nodepoolname+sku_name labels appears, it labels the node
+//     karpenter.sh/registered=true and patches the NodeClaim's Status.ProviderID to the real node
+//     ProviderID (see cprovider.NodeClaimSKUs for how sku_name is matched).
 //  4. Karpenter's Registration reconciler then finds the matching node and sets Registered=True.
 //
 // On pod restart, the NodeClaim watch ensures all existing pending NodeClaims are re-enqueued,
@@ -30,9 +31,11 @@ package nodeproviderid
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
@@ -61,7 +64,10 @@ const (
 // the real node ProviderID once the node joins the cluster.
 //
 // MaxConcurrentReconciles is 1 to ensure the read-decide-patch cycle for node assignment
-// is never executed concurrently, preventing two NodeClaims from claiming the same node.
+// is never executed concurrently, preventing two NodeClaims from claiming the same node. The
+// cycle is also serialised against the other writers of node ownership (NodeAdoptionController,
+// CloudProvider.Delete) with cprovider.NodeOwnershipMu, held from the NodeClaim LIST to the
+// status patch.
 //
 // apiReader is an uncached client that reads directly from the API server. It is used for
 // the NodeClaim list that builds usedIDs, bypassing the informer cache. This prevents a
@@ -76,24 +82,32 @@ func NewController(kubeClient client.Client) *Controller {
 	return &Controller{kubeClient: kubeClient}
 }
 
+// NewControllerWithReader is NewController with the uncached reader already set, for callers that
+// drive Reconcile without going through Register (which takes it from the manager).
+func NewControllerWithReader(kubeClient client.Client, apiReader client.Reader) *Controller {
+	return &Controller{kubeClient: kubeClient, apiReader: apiReader}
+}
+
+// rafayNodePredicate filters node events to only those where the node already has a real
+// spec.providerID and the Rafay labels. This avoids triggering reconciles for:
+//   - node updates that don't affect ProviderID or labels (e.g. status heartbeats)
+//   - node deletes
+//   - nodes from other providers
+//
+// It is a package-level variable so its event filtering can be unit-tested.
+var rafayNodePredicate = predicate.NewPredicateFuncs(func(obj client.Object) bool {
+	node, ok := obj.(*corev1.Node)
+	if !ok {
+		return false
+	}
+	return node.Spec.ProviderID != "" &&
+		node.Labels[nodepoolNameLabel] != "" &&
+		node.Labels[skuNameLabel] != ""
+})
+
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 	// Store the uncached API reader; must be set before any reconcile runs.
 	c.apiReader = m.GetAPIReader()
-
-	// rafayNodePredicate filters node events to only those where the node already has a real
-	// spec.providerID and the Rafay labels. This avoids triggering reconciles for:
-	//   - node updates that don't affect ProviderID or labels (e.g. status heartbeats)
-	//   - node deletes
-	//   - nodes from other providers
-	rafayNodePredicate := predicate.NewPredicateFuncs(func(obj client.Object) bool {
-		node, ok := obj.(*corev1.Node)
-		if !ok {
-			return false
-		}
-		return node.Spec.ProviderID != "" &&
-			node.Labels[nodepoolNameLabel] != "" &&
-			node.Labels[skuNameLabel] != ""
-	})
 
 	return controllerruntime.NewControllerManagedBy(m).
 		Named("nodeclaim.nodeproviderid").
@@ -129,15 +143,29 @@ func (c *Controller) Reconcile(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 	// Read the current NodeClaim list directly from the API server (not the informer cache).
 	// This is critical: after patching NodeClaim A's ProviderID, the informer cache may not
 	// yet reflect the change when NodeClaim B's reconcile starts. Reading from the API server
-	// guarantees we see A's real ProviderID in usedIDs, preventing double-assignment.
+	// guarantees we see A's real ProviderID in usedIDs, preventing double-assignment. The
+	// ownership lock is held from here to the status patch so the adoption controller cannot
+	// create a NodeClaim for the node this reconcile is about to bind (or the reverse).
+	cprovider.NodeOwnershipMu.Lock()
+	defer cprovider.NodeOwnershipMu.Unlock()
 	var claimList karpv1.NodeClaimList
 	if err := c.apiReader.List(ctx, &claimList); err != nil {
 		return reconcile.Result{}, err
 	}
+	//
+	// A node is taken by either of two records, and both are read: status.providerID once a
+	// NodeClaim is Launched, and the adoption controller's reservation annotation before that. An
+	// adopted NodeClaim has an empty status until Karpenter's Launch reconciler calls Create(), and
+	// in that window karpenter.rafay.io/adopted-provider-id is the only thing that says the node is
+	// owned. The adoption controller reads the same two records (its claimedIDs), so the two
+	// controllers agree on which nodes are free.
 	usedIDs := make(map[string]bool, len(claimList.Items))
 	for i := range claimList.Items {
-		pid := claimList.Items[i].Status.ProviderID
-		if pid != "" && !strings.HasPrefix(pid, cprovider.PendingProviderIDPrefix) {
+		nc := &claimList.Items[i]
+		if pid := nc.Status.ProviderID; pid != "" && !strings.HasPrefix(pid, cprovider.PendingProviderIDPrefix) {
+			usedIDs[pid] = true
+		}
+		if pid := nc.Annotations[cprovider.AdoptedProviderIDAnnotationKey]; pid != "" {
 			usedIDs[pid] = true
 		}
 	}
@@ -155,6 +183,7 @@ func (c *Controller) Reconcile(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 	// Find the first unclaimed node with a matching sku that was created after this NodeClaim.
 	// The creation-time guard ensures we don't claim a pre-existing node from a different workload.
 	var found string
+	var foundNode *corev1.Node
 	for i := range nodeList.Items {
 		n := &nodeList.Items[i]
 		if !skus[n.Labels[skuNameLabel]] {
@@ -168,12 +197,25 @@ func (c *Controller) Reconcile(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 			continue
 		}
 		found = pid
+		foundNode = n
 		break
 	}
 
 	if found == "" {
 		// Node not yet visible; requeue and check again.
 		return reconcile.Result{RequeueAfter: nodeWaitRequeueTime}, nil
+	}
+
+	// Label the node registered before binding it. Karpenter's Registration reconciler expects a
+	// node to arrive with the karpenter.sh/unregistered startup taint and, for one that lacks it,
+	// logs an error and emits an UnregisteredTaintMissing event unless the node already carries
+	// karpenter.sh/registered. Platform-built nodes never have the taint (the broker renders no
+	// startupTaints and the platform applies none), so without this every scale-out reports a
+	// spurious registration error. Same reasoning as nodeadoption.prepareNode for adopted nodes.
+	// The node goes first because the label is harmless on its own, whereas a bound claim whose
+	// node was never labelled is not revisited (the claim is no longer pending).
+	if err := c.markRegistered(ctx, foundNode); err != nil {
+		return reconcile.Result{}, err
 	}
 
 	// Patch the NodeClaim's ProviderID with the real value. Optimistic locking ensures
@@ -192,6 +234,20 @@ func (c *Controller) Reconcile(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 	}
 	klog.Infof("nodeproviderid: assigned providerID=%s to nodeclaim=%s", found, nodeClaim.Name)
 	return reconcile.Result{}, nil
+}
+
+// markRegistered stamps karpenter.sh/registered=true onto the node when it is not there yet.
+func (c *Controller) markRegistered(ctx context.Context, node *corev1.Node) error {
+	if node.Labels[karpv1.NodeRegisteredLabelKey] == "true" {
+		return nil
+	}
+	stored := node.DeepCopy()
+	patched := node.DeepCopy()
+	patched.Labels = lo.Assign(patched.Labels, map[string]string{karpv1.NodeRegisteredLabelKey: "true"})
+	if err := c.kubeClient.Patch(ctx, patched, client.MergeFrom(stored)); err != nil {
+		return fmt.Errorf("label node %s %s=true: %w", node.Name, karpv1.NodeRegisteredLabelKey, err)
+	}
+	return nil
 }
 
 // nodesToNodeClaims maps Node events to NodeClaim reconcile requests.

@@ -115,16 +115,18 @@ batchSender goroutine:
   collectBatch: blocks until the FIRST item arrives, then collects for up to
                 batchWindow (10 s) or maxBatchSize (10 items)
   → partitions by kind: adds → SendBatch, removes → SendBatchRemove
-  → on broker ACK: sends BatchResult{} to each resultCh  ← unblocks Create()/Delete()
-  → stores batch in inProgress map (pollAfter = send + 120 s)
+  → on broker ACK: sends BatchResult{BatchID} to each resultCh  ← unblocks Create()/Delete()
+  → stores batch in inProgress map (polled on the next ticker tick — no initial delay)
 
 statusPoller goroutine:
   every 30s: PollBatchStatus(batchID) for each in-progress batch
-  → SUCCEEDED: record operationID in `succeeded`, clear from `inFlight`
+  → SUCCEEDED: record operationID (+ detail, provider IDs) in `succeeded`, clear from `inFlight`
                (removes: this is what lets Delete() converge — see below)
   → FAILED:    invoke FailureHandler(operationID, kind, detail), clear from `inFlight`
                (so a retry is able to re-send the operation)
-  → expiry:    batches older than 2 h (maxBatchAge), or unknown at the broker
+  → unknown state: logged once, treated as still in progress
+  → expiry:    batches older than 3 h (maxBatchAge — above the 60-min node-add bound and the
+               broker's 90-min add deadline; never shorten it), or unknown at the broker
                (3 consecutive empty status responses), are dropped; remaining
                items are treated as FAILED ("batch expired at broker")
 ```
@@ -137,20 +139,30 @@ delayed by at most one full window.
 `NodeProviderIDController` when the node joins — broker SUCCEEDED is not on the registration
 critical path. For removes, `Delete()` returns `nil` at ACK, but Karpenter's termination
 controller re-invokes it **every 5 s** and releases the Node's finalizer only on a
-`NodeClaimNotFoundError`. The batcher's `Succeeded(operationID)` is the convergence signal:
-once the poller records `<uid>-remove` as SUCCEEDED, the next `Delete()` reports the instance
-gone and termination completes.
+`NodeClaimNotFoundError`. The batcher's `Succeeded(operationID)` / `SucceededResult` is the
+convergence signal: once the poller records `<uid>-remove` as SUCCEEDED, the next `Delete()`
+reports the instance gone — as soon as the NodeClaim's own machine has stopped (its Node absent
+or NotReady; removes are untargeted, so the broker's SUCCEEDED alone does not say *this* machine
+went) — and termination completes.
 
 > **Node existence cannot be the completion signal.** During termination Karpenter holds the
 > Node object alive with **its own** finalizer, which it drops only once `Delete()` reports the
 > instance gone. "Is there still a Node with this providerID?" is therefore circular and never
 > converges. `Delete()` used to return `nil` forever after ACK, leaving NodeClaims and Nodes
-> `Terminating` indefinitely.
+> `Terminating` indefinitely. Node *readiness* is a different matter — the finalizer keeps the
+> object, not the heartbeat — which is why `Delete()` waits for NotReady after SUCCEEDED.
+
+**No initial poll delay.** Every batch is polled on the next 30 s tick after its ACK. A remove's
+SUCCEEDED tombstone is written the moment the decrement is published, and an add's permanent
+refusal (`pool at maximum`, `pool not found`, …) is decided when the broker claims the batch —
+both must reach `Delete()` / the failure handler within one poll interval. The former 120 s delay
+turned every refused pool into a 2½-minute NodeClaim churn loop.
 
 **In-flight suppression.** Because `Delete()` is re-invoked every 5 s for the whole life of a
 removal, every ACKed-but-not-terminal operationID is held in an `inFlight` set; re-enqueueing one
 resolves the caller immediately instead of sending a duplicate batch. Without it, each reconcile
-pushed another remove batch onto the broker's **global** 64-slot queue.
+pushed another remove batch onto the broker's queue (now **per edge**, 16 waiting batches; it
+used to be one global 64-slot queue shared by every cluster).
 
 **Multi-waiter fan-out.** `pending` maps an operationID to a **slice** of result channels, so
 every caller waiting on the same operation is resolved together. With one buffered channel per
@@ -162,17 +174,25 @@ every terminal FAILED result (and for items of expired batches). The wired handl
 (`cloudprovider.NewBatchFailureHandler`, registered in `main.go` before `StartBatcher`) deletes
 the NodeClaim whose UID matches a failed **add** operationID — but only while it still carries a
 pending ProviderID and has no deletion timestamp — so a failed provision is replaced in seconds
-instead of waiting out the 60-minute registration timeout (§2). A `pool at maximum` detail (the
-broker refused the node because the pool is at its platform maximum) is the exception that must
-not be retried at once: the handler first holds the NodePool back in a `PoolBackoff`
-(`RAFAY_POOL_AT_MAX_COOLDOWN`, default 5 min) so `GetInstanceTypes` withholds its offerings, records
-a `PoolAtPlatformMaximum` Warning event on the NodePool, then deletes the NodeClaim as usual. **Remove** failures are logged only: Karpenter retries `Delete()`
-as long as the node object exists.
+instead of waiting out the 60-minute registration timeout (§2). Every FAILED add is also recorded
+per operation in `PoolBackoff` (2 h) so a `Delete()` of that pending NodeClaim knows no machine
+is coming. A permanent refusal — a detail starting `pool at maximum`, `pool not found`,
+`pool sku mismatch`, `pool not auto-scaling` or `pool precondition` (`IsPermanentRefusalDetail`,
+which also matches the wordings of older brokers) — must not be retried at once: the handler
+first holds the NodePool back in a `PoolBackoff` (`RAFAY_POOL_AT_MAX_COOLDOWN`, default 5 min) so
+`GetInstanceTypes` withholds its offerings, records a `PoolAtPlatformMaximum` (maximum) or
+`PoolRefusedByPlatform` (other refusals) Warning event on the NodePool, then deletes the NodeClaim
+as usual. **Remove** failures are logged only: Karpenter retries `Delete()` as long as the node
+object exists — except a remove an old broker refused for good (`is at its minimum`, …), which is
+recorded so the next `Delete()` converges with a `NodeNotRetired` event instead of re-sending.
 
-**Cancellation:** `Cancel(operationID)` sends a fire-and-forget `cancel_ops` to the broker
-(10 s timeout, errors logged only). Only operations still queued (ACCEPTED) at the broker are
-transitioned — via a Redis compare-and-set — to FAILED `"cancelled by client"`; RUNNING and
-terminal operations are untouched. `Delete()` uses this for NodeClaims whose node never joined.
+**Cancellation:** `Cancel(ctx, operationID) (applied bool, err error)` sends `cancel_ops` to the
+broker (10 s timeout) and reports whether it was applied. Only operations still queued (ACCEPTED)
+at the broker are transitioned — via a Redis compare-and-set — to FAILED `"cancelled by client"`;
+RUNNING and terminal operations are untouched. `Delete()` calls it **synchronously** for a
+pending NodeClaim whose add is still open: cancelled → `NodeClaimNotFoundError`; not cancellable
+→ the NodeClaim is kept until the poller reports the add's outcome (a SUCCEEDED add then gets an
+untargeted remove, a FAILED one needs nothing).
 
 **Deduplication:** `Enqueue`/`EnqueueRemove` are idempotent per `operationID` (= NodeClaim UID,
 or UID + `"-remove"` for removes). If `Create()`/`Delete()` is cancelled and retried with the same
@@ -216,7 +236,7 @@ for _, item := range batch {
 > - Terminal **FAILED** results invoke a registered `FailureHandler` that deletes the matching
 >   still-pending NodeClaim (see §4), so a failed provision recovers in seconds instead of via the
 >   60-minute registration timeout — after holding the NodePool back for a cooldown when the
->   detail says `pool at maximum`.
+>   detail is a permanent refusal (`pool at maximum`, `pool not found`, …).
 > - Terminal **SUCCEEDED** results are **recorded** in the batcher's `succeeded` set. For adds this
 >   is not on the registration critical path (the node joining is). For **removes** it is the whole
 >   ball game: it is what lets `Delete()` return `NodeClaimNotFoundError` and release the Node's
@@ -261,23 +281,29 @@ reconciler returns `NodeNotFound` repeatedly — this is expected and correct.
 
 **Logic:**
 1. Receive a single NodeClaim from the watch; skip it unless it carries the `rafay://pending/`
-   prefix (`controller.go:139`). List all NodeClaims uncached (`apiReader`) and record the
-   ProviderIDs of the non-pending ones as `usedIDs`.
+   prefix and is not deleting (the guard at the top of `Reconcile`). Take
+   `cloudprovider.NodeOwnershipMu` (held to the status patch — it serializes this controller with
+   node adoption and `Delete()`'s pending-claim lookup). List all NodeClaims uncached
+   (`apiReader`) and record the ProviderIDs of the non-pending ones **plus** every
+   `karpenter.rafay.io/adopted-provider-id` annotation as `usedIDs`.
 2. List Nodes by the `nodepoolname` label, then match `sku_name` **in code** (it cannot be a
    server-side selector — a NodeClaim may accept more than one value; see below)
 3. Find the NodeClaim whose creation timestamp is before the node's creation timestamp
 4. Verify the node is not already claimed by another NodeClaim
-5. Patch: `NodeClaim.Status.ProviderID = node.Spec.ProviderID`
+5. Label the Node `karpenter.sh/registered=true` (`markRegistered`, merge patch, skipped when
+   already set) — before the binding, so a failed node patch leaves the claim pending rather
+   than half-bound
+6. Patch: `NodeClaim.Status.ProviderID = node.Spec.ProviderID`
 
 **How `sku_name` is matched (`NodeClaimSKUs`).** A node's `sku_name` label is the **platform's**
-SKU / instance-type name, *not* the RafayNodeClass name. A node matches if its `sku_name` equals
-either:
+SKU / instance-type name, *not* the RafayNodeClass name. A node matches if its `sku_name` equals:
 
 - the NodeClaim's `node.kubernetes.io/instance-type` label — the instance type `Create()`
   actually selected, stamped onto the NodeClaim via `requirementsToLabels`; this is the
-  authoritative match, **or**
-- the NodeClaim's `spec.nodeClassRef.name` — back-compat with the legacy single-SKU convention
-  where a `RafayNodeClass` is named after its one SKU.
+  authoritative match and, when the label is present, the only one, **or**
+- only for a NodeClaim with **no** instance-type label: the NodeClaim's `spec.nodeClassRef.name` —
+  back-compat with the legacy single-SKU convention where a `RafayNodeClass` is named after its
+  one SKU.
 
 Comparing `sku_name` against `NodeClassRef.Name` **alone** meant that any `RafayNodeClass` listing
 several `instanceTypes` — exactly the configuration cheapest-fit selection exists to serve — could
@@ -365,9 +391,12 @@ out.Status.Capacity = selected.Capacity
 out.Status.Allocatable = selected.Allocatable()   // ← added
 ```
 
-`selected.Allocatable()` = `Capacity - Overhead.Total()`. Since our `InstanceTypeOverhead` is zero
-(private cloud, no system-reserved subtraction), this equals `Capacity` — but it must be set in
-`Status.Allocatable` for the scheduler to see it.
+`selected.Allocatable()` = `Capacity - Overhead.Total()`. The overhead is no longer zero: it models
+system-reserved memory (`RAFAY_VM_MEMORY_OVERHEAD_PERCENT`, default 7.5 % of nominal), kube-reserved
+cpu/memory (`RAFAY_KUBE_RESERVED_CPU` 80m, `RAFAY_KUBE_RESERVED_MEMORY` 255Mi) and the kubelet's
+100Mi eviction threshold, so `Allocatable` is what pods can really use — a pod requesting exactly a
+SKU's nominal size selects the next size up — while `Capacity` stays nominal for limits and the
+catalog count. Either way it must be set in `Status.Allocatable` for the scheduler to see it.
 
 **Why this happens without the fix:**
 The `NodeClaim.Status.Capacity` and `NodeClaim.Status.Allocatable` are separate fields. Karpenter
@@ -440,13 +469,18 @@ if !cloudprovider.IsNodeClaimNotFoundError(deleteErr) {
 
 `Delete()` always returned `nil` after broker ACK, so it never produced the one error that ends the
 loop. **NodeClaims and Nodes stayed `Terminating` indefinitely.** Worse, each 5 s reconcile called
-`EnqueueRemove` again, pushing another remove batch onto the broker's **global** 64-slot queue.
+`EnqueueRemove` again, pushing another remove batch onto the broker's queue (then one global
+64-slot queue for every cluster; now 16 slots per edge).
 
 **Fix — three parts:**
 
 1. **A real completion signal.** The status poller records every operationID the broker reports
    SUCCEEDED (`NodeBatcher.Succeeded`), and `CloudProvider.Delete` returns `NodeClaimNotFoundError`
-   once the remove op `<uid>-remove` has SUCCEEDED.
+   once the remove op `<uid>-remove` has SUCCEEDED — and, because the removal is untargeted, once
+   the NodeClaim's own machine has stopped (Node absent or NotReady, waited for up to
+   `RAFAY_REMOVE_SETTLE_WINDOW`; a Node still Ready after that means the platform retired another
+   machine, reported as `RemoveRetiredOtherMachine`). See `docs/architecture.md` §6.2 for the full
+   decision tree, including the cases where no remove is sent at all (Node already gone).
 2. **In-flight suppression.** ACKed-but-not-terminal operationIDs are held in an `inFlight` set;
    re-enqueueing one resolves immediately instead of sending a duplicate batch, so the 5 s retry
    loop costs nothing at the broker.
@@ -463,11 +497,12 @@ why it works.
 > **Broker-side companion fix.** Because `Delete()` re-sends the same deterministic `<uid>-remove`
 > operationID for as long as Karpenter retries, the broker's terminal SUCCEEDED record has to
 > outlive that retry horizon. SUCCEEDED records are now long-lived **tombstones**
-> (`karpenterBatchSucceededTTL` = **24 h**, refreshed on each duplicate send). Previously they
-> expired with the 60-minute RUNNING TTL, so a re-sent remove opID looked brand new, was ACCEPTED
-> again, and the catalog was **decremented a second time** — retiring an extra healthy machine,
-> once per hour per terminating NodeClaim. FAILED records deliberately keep the short TTL: a FAILED
-> op **must** stay retryable.
+> (`karpenterBatchSucceededTTL` = **24 h**, refreshed on each duplicate send), and a remove is
+> tombstoned the moment its decrement is published. Previously they expired with the then
+> 60-minute RUNNING TTL (now 2 h), so a re-sent remove opID looked brand new, was ACCEPTED again,
+> and the catalog was **decremented a second time** — retiring an extra healthy machine, once per
+> hour per terminating NodeClaim. FAILED records are not tombstoned: a FAILED op **must** stay
+> retryable.
 
 ---
 
@@ -557,9 +592,9 @@ re-reads the annotation from etcd, where a lost in-memory "already adopted" flag
 
 | Karpenter code | What it does | Consequence for adoption |
 |---|---|---|
-| `Registration.syncNode` → `node.Labels = lo.Assign(node.Labels, nodeClaim.Labels)` | Copies the NodeClaim's labels **onto the Node** | A label inferred from the SKU that the node does not have gets written to a running node. A `RafayNodeClass` with no `zone` yields the synthetic zone `default`, which would overwrite real topology — so well-known labels are read off the Node, and topology labels are **omitted** when it has none. `Requirements.Compatible` skips well-known keys the NodeClaim does not define and `Intersects` only compares keys present in both, so an absent zone is treated as unconstrained rather than as a mismatch. |
+| `Registration.syncNode` → `node.Labels = lo.Assign(node.Labels, nodeClaim.Labels)` | Copies the NodeClaim's labels **onto the Node** | A label inferred from the SKU that the node does not have gets written to a running node. A `RafayNodeClass` with no `zone` yields the synthetic zone `default`, which would overwrite real topology — so well-known labels are read off the Node, and topology labels are **omitted** when it has none. Omission is safe only because `validateAdoptable` applies the same **strict** check as drift: `Requirements.Compatible` *without* `AllowUndefinedWellKnownLabels` (what `areRequirementsDrifted` calls) treats an absent key as a mismatch, so a node that would fail it is never adopted; the offerings half (`Offerings.HasCompatible`) is the only lenient part. Keep `validateAdoptable` strict. |
 | `Registration.syncNode` → `Taints.Merge(nodeClaim.Spec.Taints)` | Merges the NodeClaim's taints onto the Node | Copying the pool's taints onto an adopted node would apply a `NoExecute` taint to a node already running pods and evict them. Taints are dropped from adopted NodeClaims; the platform already applied the catalog's taints to the nodes it built. |
-| `Drift.areStaticFieldsDrifted` returns `""` unless **both** objects carry `karpenter.sh/nodepool-hash` | Static drift needs the hash on the NodeClaim | Omitting the hash means a later NodePool template edit does not mark every adopted node drifted and roll nodes the operator never asked Karpenter to create. `areRequirementsDrifted` and `instanceTypeNotFound` are still live, which is why adoption pre-checks both and skips a node that would fail them. |
+| `Drift.areStaticFieldsDrifted` returns `""` unless **both** objects carry `karpenter.sh/nodepool-hash` | Static drift needs the hash on the NodeClaim | Omitting the hash means a later NodePool template edit does not mark every adopted node drifted. The exemption is made **durable**: the adopted NodeClaim is stamped with the current `karpenter.sh/nodepool-hash-version` (Karpenter's hash controller only back-fills claims whose version is stale), and every adoption pass strips a back-filled `nodepool-hash` and re-pins the version (`stripNodePoolHash`) — a hash-version bump on upgrade or a `kubectl replace` of the NodePool enqueues the pool here within moments. `areRequirementsDrifted` and `instanceTypeNotFound` are still live, which is why adoption pre-checks both and skips a node that would fail them. |
 
 ### Why adoption waits for `NodeReady`
 
@@ -585,10 +620,11 @@ if nodeutils.GetCondition(node, corev1.NodeReady).Status != corev1.ConditionTrue
 ```
 
 The claim parks at `Registered=True` / `Initialized=Unknown`, and nothing reaps it — not even
-expiration, since every broker-rendered pool sets `spec.expireAfter: Never` — so a node that never
-comes up leaves a phantom NodeClaim indefinitely. Garbage collection does not help: it only considers claims **absent** from
-`CloudProvider.List()`, and `listNodesFromKube` returns every Node carrying a `rafay://` providerID —
-which adoption has just stamped on this one.
+expiration, since every broker-rendered pool sets `spec.expireAfter: Never` (an explicit owner
+decision: expiry is not managed by this integration) — so a node that never comes up leaves a
+phantom NodeClaim indefinitely. Garbage collection does not help: it only considers claims
+**absent** from `CloudProvider.List()`, and `listNodesFromKube` returns every Node carrying a
+`rafay://` providerID — which adoption has just stamped on this one.
 
 It is not inert while parked either. `StateNode.Capacity()` fills in from the **NodeClaim** while
 uninitialized:
@@ -623,7 +659,13 @@ returns `nil`.
 from grabbing a pre-existing node (§7). Adoption is the exact complement: it skips any node **newer**
 than a pending claim for the same pool+SKU. Adopting such a node would leave that claim unresolved
 until `registrationTimeout` (60 min) deleted it. The two controllers partition every node in a pool
-between them, and `NodeClaimSKUs` is shared so they cannot disagree about which SKUs a claim accepts.
+between them, `NodeClaimSKUs` is shared so they cannot disagree about which SKUs a claim accepts,
+and both — together with `Delete()`'s pending-claim lookup — run under `cloudprovider.NodeOwnershipMu`,
+so their read-decide-write cycles never interleave. Adoption also tests the ID it *would* build
+(`rafay.BuildProviderID(pool, sku, node.Name)`) against the claimed set, so a node that re-registers
+with an empty `spec.providerID` (kubelet restart, platform re-registration) is stamped back rather
+than given a second NodeClaim; and its Node watch fires only on label / `spec.providerID` / Ready
+changes, not on heartbeats.
 
 ---
 
@@ -631,12 +673,16 @@ between them, and `NodeClaimSKUs` is shared so they cannot disagree about which 
 
 | File | Purpose |
 |---|---|
-| `pkg/rafay/batcher.go` | NodeBatcher: collects Create()/Delete() calls, sends add/remove batches to broker, polls status, FAILED feedback, cancel |
+| `pkg/rafay/batcher.go` | NodeBatcher: collects Create()/Delete() calls, sends add/remove batches to broker, polls status (30 s, no initial delay, 3 h horizon), FAILED feedback, synchronous cancel |
 | `pkg/rafay/batch_stream.go` | Short-lived gRPC stream helpers: sendBatch, sendBatchRemove, pollBatchStatus, cancelOps |
-| `pkg/rafay/brokerclient.go` | gRPC connection management; 30 s per-RPC deadlines |
-| `pkg/cloudprovider/cloudprovider.go` | CloudProvider: Create/Delete/Get/List; NewBatchFailureHandler |
-| `pkg/controllers/nodeproviderid/controller.go` | Patches real ProviderID when node joins |
-| `pkg/controllers/nodeadoption/controller.go` | Creates a NodeClaim per pre-existing worker node in a pool; fills in empty `spec.providerID` |
+| `pkg/rafay/brokerclient.go` | gRPC connection management; 30 s per-RPC deadlines (90 s for the config call); retries once on the same connection, never closes it |
+| `pkg/cloudprovider/cloudprovider.go` | CloudProvider: Create/Delete/Get/List; NewBatchFailureHandler; NodePool events; `NodeOwnershipMu` |
+| `pkg/cloudprovider/poolbackoff.go` | PoolBackoff (pool hold + per-op FAILED records); `IsPoolAtMaxDetail` / `IsPermanentRefusalDetail` / `IsNotRetiredDetail` — the detail-string contract with the broker |
+| `pkg/controllers/nodeproviderid/controller.go` | Labels the node registered, then patches the real ProviderID when it joins |
+| `pkg/controllers/nodeadoption/controller.go` | Creates a NodeClaim per pre-existing worker node in a pool; fills in empty `spec.providerID`; keeps adopted claims exempt from static drift |
+| `pkg/controllers/batchresume/controller.go` | Re-registers pending NodeClaims' add batches (from `karpenter.rafay.io/batch-id`) with the batcher after a restart |
+| `pkg/controllers/nodeconfig/controller.go` | Fetches the broker-rendered RafayNodeClass/NodePool manifests and server-side-applies them every sync (inert shape when autoscaling is off) |
+| `pkg/controllers/headroom/` | Per-pool pause-pod buffer Deployments (see `docs/headroom.md`) |
 | `karpenter/pkg/controllers/state/cluster.go` | `Synced()`, `UpdateNodeClaim()`, `podToNodeClaim` |
 | `karpenter/pkg/controllers/provisioning/provisioner.go` | Provisioning loop, `Reconcile()` |
 | `karpenter/pkg/controllers/provisioning/scheduling/scheduler.go` | `Solve()`, `addToExistingNode`, `addToInflightNode` |

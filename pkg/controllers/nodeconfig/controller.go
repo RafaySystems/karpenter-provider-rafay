@@ -64,9 +64,9 @@ const (
 	managedByLabel = "karpenter.rafay.io/managed-by"
 	managedByValue = "edge-broker"
 
-	// revisionAnnotation records the broker revision an object was last applied from. It is
-	// informational: the skip decision uses the in-memory lastRevision, and this makes the
-	// same fact visible with kubectl.
+	// revisionAnnotation records the broker revision an object was last applied from, so the
+	// fact the "applied" log line carries is also visible with kubectl. Nothing reads it back:
+	// every sync re-applies regardless (see sync).
 	revisionAnnotation = "karpenter.rafay.io/config-revision"
 
 	// defaultSyncInterval is how often the config is re-fetched after the first successful
@@ -94,8 +94,9 @@ type Controller struct {
 	syncInterval time.Duration
 
 	kubeClient client.Client
-	// lastRevision is the broker revision of the last successful apply; a resync returning the
-	// same revision is skipped. Only the leader runs the sync loop, so this needs no locking.
+	// lastRevision is the broker revision of the last successful apply. It only decides how
+	// loudly the next apply is logged: a resync returning the same revision still re-applies
+	// (see sync). Only the leader runs the sync loop, so this needs no locking.
 	lastRevision string
 }
 
@@ -197,13 +198,19 @@ func (c *Controller) Start(ctx context.Context) error {
 func (c *Controller) sync(ctx context.Context) error {
 	resp, err := c.fetcher.GetKarpenterConfig(ctx, c.clusterID, c.projectID)
 	if err != nil {
-		// NotFound is the broker saying "this cluster has no Karpenter config to serve" — no
-		// workspace compute instance behind the edge, or no worker-pool catalog on it. That is
-		// a property of the cluster, not a transient fault: error-backoff would just repeat the
-		// same answer every few seconds forever. Treat it as a successful no-op sync so the
-		// loop re-checks at the normal interval (the catalog can appear later, e.g. when the
-		// compute instance is created or autoscaling is enabled on a pool).
-		if status.Code(err) == codes.NotFound {
+		// A NotFound carrying the config-unavailable marker is the broker saying "this cluster
+		// has no Karpenter config to serve" — no workspace compute instance behind the edge, or
+		// no worker-pool catalog on it. That is a property of the cluster, not a transient
+		// fault: error-backoff would just repeat the same answer every few seconds forever.
+		// Treat it as a successful no-op sync so the loop re-checks at the normal interval (the
+		// catalog can appear later, e.g. when the compute instance is created or autoscaling
+		// is enabled on a pool).
+		//
+		// The marker is the contract. A NotFound without it (a broker that wrapped a failed
+		// edge lookup the same way) says nothing about the cluster, so it stays an error and
+		// Start retries it on the short backoff instead of leaving the cluster without
+		// NodePools for a whole sync interval.
+		if isConfigUnavailable(err) {
 			klog.Warningf("nodeconfig: edge-broker has no Karpenter config for this cluster; "+
 				"nothing to apply, checking again in %s (%v)", c.syncInterval, err)
 			return nil
@@ -221,18 +228,25 @@ func (c *Controller) sync(ctx context.Context) error {
 	}
 
 	if !resp.GetAutoScaling() {
-		// Applying NodePools would start autoscaling a cluster whose owner turned it off.
-		// Objects already applied are left in place — removing them would drain nodes, and the
-		// operator turning the toggle back on is the cheap, reversible path.
-		klog.Infof("nodeconfig: autoscaling is disabled on compute instance %q; not applying Karpenter config", resp.GetClusterName())
-		return nil
+		// The owner turned autoscaling off. The broker still ships every pool, rendered inert
+		// (limits.nodes 0, an all-reasons nodes:"0" disruption budget, the auto-scaling
+		// annotation set to "false"), so the apply below neutralises a NodePool that was live
+		// a moment ago instead of leaving it scaling: an inert manifest cannot start anything,
+		// and skipping it would keep the last live NodePool in force until the toggle came
+		// back on. Nodes already provisioned are left in place — the inert budget stops
+		// Karpenter from draining them — and lastRevision advances like any other sync.
+		klog.Infof("nodeconfig: autoscaling is disabled on compute instance %q; applying the inert Karpenter config", resp.GetClusterName())
 	}
 
+	// The revision is a fingerprint of the broker's rendered YAML, not of the cluster: it is
+	// identical on every resync while the catalog is unchanged, including after an operator
+	// deleted or hand-edited a managed object. So an unchanged revision never skips the apply
+	// — server-side apply is idempotent and this is a handful of patches per interval — it
+	// only turns the "applied" log line down to V(2). That is what makes the deployment.yaml
+	// promise "the resync overwrites whatever that owner writes" hold every interval, not only
+	// after a catalog change or a restart.
 	revision := strings.TrimSpace(resp.GetRevision())
-	if revision != "" && revision == c.lastRevision {
-		klog.V(2).Infof("nodeconfig: config revision %s unchanged, nothing to apply", revision)
-		return nil
-	}
+	unchanged := revision != "" && revision == c.lastRevision
 
 	// Node classes go first: a NodePool whose nodeClassRef does not resolve stays NotReady
 	// until the class shows up, and applying in this order avoids that window entirely.
@@ -256,10 +270,26 @@ func (c *Controller) sync(ctx context.Context) error {
 	}
 
 	c.lastRevision = revision
-	klog.Infof("nodeconfig: applied %d RafayNodeClass and %d NodePool objects for cluster %q (revision %s)",
-		len(classes), len(pools), resp.GetClusterName(), revision)
+	if unchanged {
+		klog.V(2).Infof("nodeconfig: re-applied %d RafayNodeClass and %d NodePool objects for cluster %q (revision %s unchanged)",
+			len(classes), len(pools), resp.GetClusterName(), revision)
+	} else {
+		klog.Infof("nodeconfig: applied %d RafayNodeClass and %d NodePool objects for cluster %q (revision %s)",
+			len(classes), len(pools), resp.GetClusterName(), revision)
+	}
 	c.logOrphans(ctx, classes, pools)
 	return nil
+}
+
+// isConfigUnavailable reports whether err is the broker's "no Karpenter config for this
+// cluster" answer: a gRPC NotFound whose message carries edgev1.ErrKarpenterConfigUnavailable.
+// A NotFound without that marker is not a statement about the cluster and is retried.
+func isConfigUnavailable(err error) bool {
+	st, ok := status.FromError(err)
+	if !ok || st.Code() != codes.NotFound {
+		return false
+	}
+	return strings.Contains(st.Message(), edgev1.ErrKarpenterConfigUnavailable.Error())
 }
 
 // apply server-side-applies one object.

@@ -54,7 +54,11 @@ limitations under the License.
 //   - the pool's taints are not copied onto the NodeClaim (Registration would push them onto a node
 //     already running pods, and a NoExecute taint would evict them);
 //   - no karpenter.sh/nodepool-hash annotation is set, so a later edit to the NodePool template
-//     does not mark every adopted node drifted and roll the pool.
+//     does not mark every adopted node drifted and roll the pool. Karpenter's nodepool hash
+//     controller back-fills that annotation onto every NodeClaim of a pool after a hash-version
+//     bump; the exemption is kept durable by stamping the current hash version at creation (which
+//     makes the back-fill skip the claim) and by stripping the hash again on every pass if it
+//     was stamped anyway (see stripNodePoolHash).
 //
 // Adoption does mean Karpenter may consolidate a pre-existing node once it is empty, which is the
 // point — the pool becomes Karpenter's to size. KARPENTER_ADOPT_EXISTING_NODES=false turns it off.
@@ -63,6 +67,7 @@ package nodeadoption
 import (
 	"context"
 	"fmt"
+	"maps"
 	"os"
 	"strconv"
 	"strings"
@@ -79,6 +84,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	crcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -131,7 +137,9 @@ type InstanceTypeProvider interface {
 //
 // MaxConcurrentReconciles is 1 so the count-decide-create cycle never runs concurrently for two
 // pools: the decision reads every NodeClaim in the cluster, and two overlapping passes could both
-// conclude the same node is unowned.
+// conclude the same node is unowned. The same cycle is serialised against the other writers of
+// node ownership (NodeProviderIDController, CloudProvider.Delete) with cprovider.NodeOwnershipMu,
+// held from the NodeClaim LIST to the last Create of the pass.
 //
 // apiReader is an uncached client reading straight from the API server. The NodeClaim list goes
 // through it because a freshly created NodeClaim is not in the informer cache yet, and a stale read
@@ -164,20 +172,49 @@ func EnabledFromEnv() bool {
 	return enabled
 }
 
+// rafayNodePredicate passes only nodes that carry the platform's pool identity. Unlike the
+// NodeProviderIDController's predicate it does NOT require spec.providerID to be set — a node
+// with an empty provider ID is exactly the case this controller fixes.
+//
+// Updates are filtered further: a node reaches the pool's reconcile only when something adoption
+// decides on has changed — its labels (pool identity, control-plane role), spec.providerID, or
+// the kubelet's Ready status. Every other Update is a status heartbeat (the kubelet reports every
+// few minutes per node, plus condition and image-list churn), and each reconcile it would trigger
+// costs an uncached NodeClaim LIST against the API server just to conclude there is nothing to
+// adopt. Whatever such an event could have changed, the resync catches.
+//
+// It is a package-level variable so its event filtering can be unit-tested.
+var rafayNodePredicate = predicate.Funcs{
+	CreateFunc:  func(e event.CreateEvent) bool { return isPoolNode(e.Object) },
+	DeleteFunc:  func(e event.DeleteEvent) bool { return isPoolNode(e.Object) },
+	GenericFunc: func(e event.GenericEvent) bool { return isPoolNode(e.Object) },
+	UpdateFunc: func(e event.UpdateEvent) bool {
+		if !isPoolNode(e.ObjectNew) {
+			return false
+		}
+		oldNode, ok := e.ObjectOld.(*corev1.Node)
+		if !ok {
+			return true
+		}
+		newNode := e.ObjectNew.(*corev1.Node)
+		return !maps.Equal(oldNode.Labels, newNode.Labels) ||
+			oldNode.Spec.ProviderID != newNode.Spec.ProviderID ||
+			isReady(oldNode) != isReady(newNode)
+	},
+}
+
+// isPoolNode reports whether the object is a node carrying both platform pool labels.
+func isPoolNode(obj client.Object) bool {
+	node, ok := obj.(*corev1.Node)
+	if !ok {
+		return false
+	}
+	return node.Labels[nodepoolNameLabel] != "" && node.Labels[skuNameLabel] != ""
+}
+
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 	// Store the uncached API reader; must be set before any reconcile runs.
 	c.apiReader = m.GetAPIReader()
-
-	// rafayNodePredicate passes only nodes that carry the platform's pool identity. Unlike the
-	// NodeProviderIDController's predicate it does NOT require spec.providerID to be set — a node
-	// with an empty provider ID is exactly the case this controller fixes.
-	rafayNodePredicate := predicate.NewPredicateFuncs(func(obj client.Object) bool {
-		node, ok := obj.(*corev1.Node)
-		if !ok {
-			return false
-		}
-		return node.Labels[nodepoolNameLabel] != "" && node.Labels[skuNameLabel] != ""
-	})
 
 	return controllerruntime.NewControllerManagedBy(m).
 		Named("nodepool.nodeadoption").
@@ -243,6 +280,10 @@ func (c *Controller) Reconcile(ctx context.Context, nodePool *karpv1.NodePool) (
 	}
 
 	// NodeClaims come from the API server — see the Controller doc for why the cache is unsafe here.
+	// The ownership lock is held from this LIST until the pass has created its last NodeClaim, so
+	// NodeProviderIDController cannot bind a node this pass is about to adopt (or the reverse).
+	cprovider.NodeOwnershipMu.Lock()
+	defer cprovider.NodeOwnershipMu.Unlock()
 	var claimList karpv1.NodeClaimList
 	if err := c.apiReader.List(ctx, &claimList); err != nil {
 		return reconcile.Result{}, fmt.Errorf("list nodeclaims: %w", err)
@@ -255,6 +296,7 @@ func (c *Controller) Reconcile(ctx context.Context, nodePool *karpv1.NodePool) (
 	claimedIDs := make(map[string]bool, len(claimList.Items))
 	var pendingClaims []*karpv1.NodeClaim
 	poolClaims := 0
+	var errs error
 	for i := range claimList.Items {
 		nc := &claimList.Items[i]
 		if pid := nc.Status.ProviderID; pid != "" && !strings.HasPrefix(pid, cprovider.PendingProviderIDPrefix) {
@@ -270,6 +312,10 @@ func (c *Controller) Reconcile(ctx context.Context, nodePool *karpv1.NodePool) (
 		if strings.HasPrefix(nc.Status.ProviderID, cprovider.PendingProviderIDPrefix) && nc.DeletionTimestamp.IsZero() {
 			pendingClaims = append(pendingClaims, nc)
 		}
+		// Keep the static-drift exemption of an adopted claim durable: see stripNodePoolHash.
+		if err := c.stripNodePoolHash(ctx, nc); err != nil {
+			errs = multierr.Append(errs, fmt.Errorf("strip nodepool hash from nodeclaim %s: %w", nc.Name, err))
+		}
 	}
 
 	workerNodes := lo.CountBy(allNodes.Items, func(n corev1.Node) bool {
@@ -280,7 +326,6 @@ func (c *Controller) Reconcile(ctx context.Context, nodePool *karpv1.NodePool) (
 	// pool's RafayNodeClass.
 	var instanceTypes []*cloudprovider.InstanceType
 	adopted, skipped, notReady := 0, 0, 0
-	var errs error
 
 	for i := range poolNodes.Items {
 		node := &poolNodes.Items[i]
@@ -322,7 +367,23 @@ func (c *Controller) Reconcile(ctx context.Context, nodePool *karpv1.NodePool) (
 			// Some other provider owns this node despite the Rafay pool labels.
 			continue
 		}
-		if providerID != "" && claimedIDs[providerID] {
+		// The ownership test runs on the ID the node will end up with, not only on the one it has:
+		// the ID prepareNode builds is deterministic from pool, SKU and hostname, so a Node object
+		// that was deleted and re-registered by its kubelet with an empty spec.providerID rebuilds
+		// exactly the ID its existing NodeClaim already carries. Testing only a pre-set ID would
+		// hand that machine a second NodeClaim.
+		candidateID := providerID
+		if candidateID == "" {
+			candidateID = rafay.BuildProviderID(nodePool.Name, sku, node.Name)
+		}
+		if candidateID != "" && claimedIDs[candidateID] {
+			if providerID == "" {
+				// The claim that owns this ID is looking for a node carrying it; stamp it back so
+				// the claim's Registration finds the re-registered node instead of timing out.
+				if _, err := c.prepareNode(ctx, node, nodePool.Name, sku); err != nil {
+					errs = multierr.Append(errs, fmt.Errorf("prepare re-registered node %s: %w", node.Name, err))
+				}
+			}
 			continue
 		}
 		if claimedByPendingClaim(pendingClaims, node, sku) {
@@ -456,9 +517,13 @@ func equalNodes(a, b *corev1.Node) bool {
 //     has already applied the pool's catalog taints to the nodes it built.
 //   - no resource requests are set, so Initialization does not wait for an extended resource
 //     (a GPU device plugin, say) that this node was never asked to advertise.
-//   - the karpenter.sh/nodepool-hash annotations are omitted. Static drift is only evaluated when
+//   - the karpenter.sh/nodepool-hash annotation is omitted. Static drift is only evaluated when
 //     both NodePool and NodeClaim carry the hash, so leaving it off means a later edit to the pool
 //     template does not mark every adopted node drifted and roll nodes the operator did not create.
+//     karpenter.sh/nodepool-hash-version IS set, to the current version: Karpenter's nodepool hash
+//     controller back-fills the hash onto every NodeClaim whose version annotation is stale, and a
+//     claim already at the current version is left alone. (After a hash-version bump the claim is
+//     stale again and gets stamped; stripNodePoolHash undoes that on the next pass.)
 //   - well-known labels come from the node, not from the SKU (see wellKnownNodeLabels).
 func adoptedNodeClaim(nodePool *karpv1.NodePool, node *corev1.Node, sku string, instanceType *cloudprovider.InstanceType) *karpv1.NodeClaim {
 	nodeClaim := nodePool.Spec.Template.ToNodeClaim()
@@ -483,9 +548,43 @@ func adoptedNodeClaim(nodePool *karpv1.NodePool, node *corev1.Node, sku string, 
 		},
 	)
 	nodeClaim.Annotations = lo.Assign(nodePool.Spec.Template.Annotations, map[string]string{
-		adoptedNodeAnnotationKey: node.Name,
+		adoptedNodeAnnotationKey:                node.Name,
+		karpv1.NodePoolHashVersionAnnotationKey: karpv1.NodePoolHashVersion,
 	})
 	return nodeClaim
+}
+
+// stripNodePoolHash removes karpenter.sh/nodepool-hash from an adopted NodeClaim that has acquired
+// one, re-pinning karpenter.sh/nodepool-hash-version to the current version in the same patch.
+//
+// adoptedNodeClaim leaves the hash off so that a NodePool template edit never marks an adopted
+// node drifted (see there). Karpenter's nodepool hash controller undoes that whenever the NodePool
+// lacks the current hash-version annotation — after a Karpenter upgrade that bumps
+// NodePoolHashVersion, or an operator `kubectl replace` of the NodePool that drops it: it lists the
+// pool's NodeClaims and stamps both the hash and the version onto every one whose version is
+// stale, adopted claims included. From then on the next re-render of the pool template would roll
+// every adopted node. That controller patches the NodePool's own annotations right afterwards,
+// which enqueues the pool here, so the strip lands within moments of the stamp. Re-pinning the
+// version is what makes the exemption hold until the next bump rather than the next reconcile.
+//
+// Anything without the adoption marker, or without a hash, is left untouched.
+func (c *Controller) stripNodePoolHash(ctx context.Context, nc *karpv1.NodeClaim) error {
+	if nc.Annotations[cprovider.AdoptedProviderIDAnnotationKey] == "" || !nc.DeletionTimestamp.IsZero() {
+		return nil
+	}
+	if _, ok := nc.Annotations[karpv1.NodePoolHashAnnotationKey]; !ok {
+		return nil
+	}
+	stored := nc.DeepCopy()
+	patched := nc.DeepCopy()
+	delete(patched.Annotations, karpv1.NodePoolHashAnnotationKey)
+	patched.Annotations[karpv1.NodePoolHashVersionAnnotationKey] = karpv1.NodePoolHashVersion
+	if err := c.kubeClient.Patch(ctx, patched, client.MergeFrom(stored)); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	klog.Infof("nodeadoption: stripped %s from adopted nodeclaim %s so a NodePool template edit does not drift it",
+		karpv1.NodePoolHashAnnotationKey, nc.Name)
+	return nil
 }
 
 // wellKnownNodeLabels returns the well-known labels an adopted NodeClaim carries.
@@ -498,9 +597,17 @@ func adoptedNodeClaim(nodePool *karpv1.NodePool, node *corev1.Node, sku string, 
 //
 // Topology labels are deliberately absent when the node has none. A RafayNodeClass with no zone
 // yields the synthetic zone "default", and stamping that onto an adopted node would replace real
-// topology information (or invent it). Omitting the key is safe in both directions: zone is a
-// well-known label, so Karpenter treats a NodeClaim that lacks it as unconstrained when matching
-// the pool's requirements and the SKU's offerings, rather than as a mismatch.
+// topology information (or invent it).
+//
+// Omitting the key is NOT free in Karpenter's requirements matching: Requirements.Compatible
+// without scheduling.AllowUndefinedWellKnownLabels — which is what the drift sub-controller's
+// areRequirementsDrifted calls — reports "label ... does not have known values" for any In
+// requirement whose key the NodeClaim's labels lack, well-known or not. (Only the offerings half is
+// lenient: Offerings.HasCompatible treats a missing zone as compatible with any offering.) What
+// makes the omission safe is that validateAdoptable applies the very same strict Compatible before
+// a NodeClaim is created, so a pool that requires the key never adopts a node without it; the node
+// is skipped with a warning instead of adopted-then-drifted. Keep validateAdoptable strict — do not
+// relax it with AllowUndefinedWellKnownLabels, or such nodes would be adopted and drained.
 func wellKnownNodeLabels(node *corev1.Node, sku string, instanceType *cloudprovider.InstanceType) map[string]string {
 	labels := map[string]string{
 		corev1.LabelInstanceTypeStable: sku,
@@ -604,9 +711,10 @@ func claimedByPendingClaim(pendingClaims []*karpv1.NodeClaim, node *corev1.Node,
 //     and charges the pool's limits for, a machine that is not there.
 //   - It would be stuck. Initialization requires NodeReady, so the claim would sit at
 //     Registered=True / Initialized=Unknown("NodeNotReady") — and Liveness only deletes claims that
-//     fail to *register*, which this one did not. Nothing else reaps it either — not even
-//     expiration, since every broker-rendered pool sets spec.expireAfter: Never — so a node that
-//     never comes up leaves a phantom NodeClaim indefinitely.
+//     fail to *register*, which this one did not. Nothing else reaps it promptly either: node
+//     expiry is deliberately not managed by this integration (the pool keeps the NodePool
+//     default expireAfter, and an inert pool pins Never), so a node that never comes up leaves a
+//     phantom NodeClaim for as long as that expiry allows — indefinitely on an inert pool.
 //   - It may not be a node at all. A machine mid-teardown, or one whose kubelet never joined
 //     properly, presents exactly as NotReady; adopting it writes an immutable spec.providerID onto
 //     an object that is on its way out.

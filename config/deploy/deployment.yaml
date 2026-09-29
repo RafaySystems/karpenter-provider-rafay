@@ -7,6 +7,8 @@
 # Install order: apply config/crd/ (NodeClaim, NodePool, RafayNodeClass) BEFORE starting the controller.
 # If the controller started before NodeClaim CRDs existed, restart the pod so Karpenter can register
 # the field index on status.providerID (otherwise you see "Index ... field:status.providerID does not exist").
+# The readiness probe (/readyz, "crd" check) stays failing while the CRDs are missing, so the pod is
+# visibly NotReady in that state — it does not self-heal once they appear; the restart is still needed.
 #
 # Edge-broker only: TLS Secret + env aligned with edge-client Deployment.
 #
@@ -32,30 +34,72 @@ spec:
         app.kubernetes.io/component: controller
     spec:
       serviceAccountName: karpenter-provider-rafay
+      # Satisfies the "restricted" Pod Security Standard: the image is distroless/static nonroot, the
+      # process writes nothing to its filesystem and needs no capabilities.
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
         runAsGroup: 65532
         fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: controller
           image: karpenter-provider-rafay:latest
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: http-metrics
+              containerPort: 8080
+              protocol: TCP
+            # Karpenter's operator serves /healthz and /readyz here (HEALTH_PROBE_PORT, default 8081).
+            # /readyz also fails until the NodePool/NodeClaim CRDs resolve and the caches have synced.
+            - name: http-probe
+              containerPort: 8081
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http-probe
+            initialDelaySeconds: 30
+            timeoutSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http-probe
+            initialDelaySeconds: 5
+            timeoutSeconds: 30
           env:
             - name: LEADER_ELECTION_NAMESPACE
+              value: "karpenter"
+            # Karpenter sets the Go GC soft memory limit to 90% of this (debug.SetMemoryLimit), so the
+            # process collects harder as it nears the cgroup limit instead of being OOM-killed.
+            - name: MEMORY_LIMIT
+              valueFrom:
+                resourceFieldRef:
+                  containerName: controller
+                  resource: limits.memory
+                  divisor: "1"
+            # Headroom pause-pod Deployments (and the headroom-policy ConfigMap, via
+            # HEADROOM_CONFIG_NAMESPACE which defaults to this) live in the same namespace as the
+            # leader-election Lease — see namespace-karpenter-leader.yaml before hardening it.
+            - name: HEADROOM_NAMESPACE
               value: "karpenter"
             # Secured gRPC: same TLS + port env as edge-client (client.crt OU host, EDGE_CLIENT_SERVER_PORT).
             - name: EDGE_CLIENT_CERT_FOLDER
               value: "/opt/rcloud/certs"
             - name: EDGE_CLIENT_SERVER_PORT
               value: "443"
-            # If EdgeCommandService is only on internal plaintext :5449, set:
-            # - name: EDGE_BROKER_GRPC_INSECURE
-            #   value: "true"
-            # - name: EDGE_BROKER_GRPC_PORT
-            #   value: "5449"
-            # - name: EDGE_BROKER_GRPC_HOST
-            #   value: "edge-broker.rafay-system.svc.cluster.local"
+            # Do NOT switch to the broker's plaintext internal listener (:5449) with
+            # EDGE_BROKER_GRPC_INSECURE=true / EDGE_BROKER_GRPC_PORT / EDGE_BROKER_GRPC_HOST:
+            # KarpenterBatchService derives the edge id from the mTLS client certificate and
+            # rejects every stream on a plaintext peer with NO CLIENT ID, so no node would ever
+            # be provisioned. The insecure env vars exist for local development against a
+            # broker built without mTLS only.
             # Optional: broker uses client.crt O= for identity; only for logging if set.
             - name: EDGE_ID
               value: ""

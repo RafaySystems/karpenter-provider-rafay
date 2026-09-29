@@ -4,3 +4,6 @@
 !go.mod
 !go.sum
 !karpenter-provider-rafay.big
+# The CRD schema guard (pkg/apis/v1alpha1 TestMsCRDSchemaMatchesGoTypes) reads config/crd during the
+# in-image `go test` gate, so the CRD must be in the build context.
+!config/crd

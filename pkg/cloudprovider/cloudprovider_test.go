@@ -409,7 +409,7 @@ func TestBatchFailureHandlerDeletesPendingClaim(t *testing.T) {
 }
 
 func TestBatchFailureHandlerKeepsResolvedClaim(t *testing.T) {
-	claim := newNodeClaim("resolved-claim", "op-2", "rafay://cluster-1/node-1")
+	claim := newNodeClaim("resolved-claim", "op-2", "rafay://pool1/oci-inst/host-w1-e6a5c")
 	cl := newFakeClientWithClaims(t, claim)
 	handler := NewBatchFailureHandler(cl, cl, nil, nil)
 
@@ -573,8 +573,10 @@ func TestNodeClaimSKUs(t *testing.T) {
 	if !skus["oci-inst-large"] {
 		t.Error("selected instance type must be an acceptable sku_name (multi-SKU NodeClass)")
 	}
-	if !skus["mixed-class"] {
-		t.Error("NodeClass name must remain an acceptable sku_name (legacy single-SKU)")
+	// The NodeClass name is only a fallback for a NodeClaim without an instance-type label
+	// (R1-prov-cloudprovider-7): with the label present it must not match another SKU's node.
+	if skus["mixed-class"] {
+		t.Error("NodeClass name must not match once the instance-type label is present")
 	}
 	if skus["something-else"] {
 		t.Error("unrelated sku must not match")

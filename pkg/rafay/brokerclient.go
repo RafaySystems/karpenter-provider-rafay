@@ -57,6 +57,13 @@ const (
 // BrokerClient talks to edge-broker over the same TLS/insecure dial as before; node add/remove use
 // rep.edge.v1.KarpenterBatchService.BatchStreamOperations (not EdgeCommandService).
 // It keeps one long-lived *grpc.ClientConn; each call opens a short-lived bidi stream on that connection.
+//
+// The connection is shared by the batch sender, the status poller, Cancel and the nodeconfig sync,
+// which run in separate goroutines. It is therefore never closed on an RPC failure: closing a
+// *grpc.ClientConn aborts every stream currently open on it with codes.Canceled, so one goroutine's
+// Unavailable would turn into a lost send or poll for another (a send whose batch the broker had
+// already ACCEPTED would be reported as failed). A ClientConn reconnects on its own after a
+// transport failure; callBroker only resets the reconnect backoff and retries once.
 type BrokerClient struct {
 	CertPath     string
 	KeyPath      string
@@ -160,6 +167,8 @@ func (c *BrokerClient) getConn(ctx context.Context) (*grpc.ClientConn, error) {
 	return c.conn, nil
 }
 
+// closeConnLocked closes and forgets the cached connection. It is a shutdown/test hook, not a
+// recovery path: see the type comment for why RPC failures never close the shared conn.
 func (c *BrokerClient) closeConnLocked() {
 	if c.conn != nil {
 		klog.V(2).Info("edge-broker: closing gRPC connection")
@@ -174,6 +183,10 @@ func (c *BrokerClient) closeConn() {
 	c.closeConnLocked()
 }
 
+// shouldRedial reports whether err is a codes.Unavailable status (possibly wrapped): the broker
+// went away mid-call or the connection is between transports. The name is historical — the
+// client no longer redials on it (see the BrokerClient comment); it decides whether callBroker
+// retries an idempotent call once.
 func shouldRedial(err error) bool {
 	st, ok := status.FromError(err)
 	if !ok {
@@ -182,6 +195,11 @@ func shouldRedial(err error) bool {
 	return st.Code() == codes.Unavailable
 }
 
+// callBroker calls fn with the shared connection and, on codes.Unavailable, retries it once on
+// the same connection. Use only for calls that are safe to repeat (status poll, cancel, config
+// read). The conn is deliberately not closed: gRPC reconnects by itself, and closing it would
+// abort the streams other goroutines have open on it. ResetConnectBackoff makes the retry attempt
+// a reconnect immediately instead of failing fast for the rest of the current backoff period.
 func (c *BrokerClient) callBroker(ctx context.Context, fn func(cc *grpc.ClientConn) error) error {
 	cc, err := c.getConn(ctx)
 	if err != nil {
@@ -189,30 +207,24 @@ func (c *BrokerClient) callBroker(ctx context.Context, fn func(cc *grpc.ClientCo
 	}
 	err = fn(cc)
 	if err != nil && shouldRedial(err) {
-		klog.Warningf("edge-broker: RPC failed (%v), closing connection and retrying once", err)
-		c.closeConn()
-		cc2, err2 := c.getConn(ctx)
-		if err2 != nil {
-			return err2
-		}
-		err = fn(cc2)
+		klog.Warningf("edge-broker: RPC failed (%v), retrying once", err)
+		cc.ResetConnectBackoff()
+		err = fn(cc)
 	}
 	return err
 }
 
-// callBrokerOnce calls fn with a connection but does not retry. Use for streaming operations
-// that must not be re-issued (e.g. SendBatch, SendBatchRemove) since retrying could duplicate work.
-// On Unavailable the connection is closed so the next call gets a fresh one.
+// callBrokerOnce calls fn with the shared connection and does not retry. Use for streaming
+// operations that must not be re-issued (SendBatch, SendBatchRemove) since retrying could
+// duplicate work: the broker may have ACCEPTED the batch before the response was lost, and the
+// application-level retry (Karpenter re-calling Create/Delete with the same operation ID) is
+// deduplicated there. The conn is kept: the next call reconnects transparently if needed.
 func (c *BrokerClient) callBrokerOnce(ctx context.Context, fn func(cc *grpc.ClientConn) error) error {
 	cc, err := c.getConn(ctx)
 	if err != nil {
 		return err
 	}
-	err = fn(cc)
-	if err != nil && shouldRedial(err) {
-		c.closeConn()
-	}
-	return err
+	return fn(cc)
 }
 
 func (c *BrokerClient) streamContext(ctx context.Context) context.Context {
@@ -301,7 +313,7 @@ func (c *BrokerClient) PollBatchStatus(ctx context.Context, batchID string) ([]*
 //
 // The broker resolves the cluster from the mTLS client certificate; clusterID/projectID are
 // sent for its logs only. Unlike the batch calls this is a plain unary RPC, so it goes through
-// callBroker and gets the one-shot redial on Unavailable — a retried read is harmless.
+// callBroker and gets the one-shot retry on Unavailable — a retried read is harmless.
 func (c *BrokerClient) GetKarpenterConfig(ctx context.Context, clusterID, projectID string) (*v1.KarpenterConfigResponse, error) {
 	if strings.TrimSpace(c.StreamID) == "" {
 		return nil, fmt.Errorf("STREAM_ID is required")

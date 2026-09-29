@@ -1,9 +1,13 @@
-# Holds leader-election Lease objects only. Pod stays in rafay-system; Rafay drift webhook blocks
-# Lease create/update in rafay-system, so LEADER_ELECTION_NAMESPACE must point here (or another allowed ns).
+# Namespace the controller uses for the objects it cannot keep in rafay-system:
+#   - the leader-election Lease (LEADER_ELECTION_NAMESPACE): the Rafay drift webhook blocks Lease
+#     create/update in rafay-system, so the pod stays there and the Lease lives here;
+#   - the headroom pause-pod Deployments (HEADROOM_NAMESPACE, set explicitly in deployment.yaml) and
+#     the headroom-policy ConfigMap they are configured from (HEADROOM_CONFIG_NAMESPACE).
+# Because headroom pods schedule here, do not quota pods to zero or apply a "restricted" Pod Security
+# label that the pause pods cannot satisfy — headroom would silently stop working.
 apiVersion: v1
 kind: Namespace
 metadata:
   name: karpenter
   labels:
     app.kubernetes.io/name: karpenter-provider-rafay
-    app.kubernetes.io/component: leader-election

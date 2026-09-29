@@ -1,4 +1,12 @@
-# ClusterRole for Karpenter core controllers + RafayNodeClass.
+# ClusterRole for Karpenter core controllers + this provider's own controllers.
+#
+# Kept to what the code actually performs, mirroring upstream Karpenter's chart: cluster-wide READ on the
+# objects the scheduler simulates against, WRITE only on Karpenter's own CRDs, on nodes (taints, finalizers,
+# deletion at NodeClaim termination), pod eviction/deletion (drain, legacy headroom pause pods), events,
+# and the headroom controller's Deployments/PriorityClass. Nothing here reads Secrets or ServiceAccounts:
+# the broker TLS material is a kubelet-mounted volume and the optional env comes from envFrom, neither of
+# which needs API access. Lease WRITES are namespaced (see the Role below) — the ClusterRole only reads
+# them, because the manager's cache lists leases cluster-wide with a kube-node-lease field selector.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -8,19 +16,30 @@ metadata:
 rules:
   # Karpenter CRDs
   - apiGroups: ["karpenter.sh"]
-    resources: ["nodeclaims", "nodeclaims/status", "nodepools", "nodepools/status"]
+    resources: ["nodeclaims", "nodeclaims/status", "nodeclaims/finalizers", "nodepools", "nodepools/status", "nodepools/finalizers"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   # Rafay node class
   - apiGroups: ["karpenter.rafay.io"]
     resources: ["rafaynodeclasses", "rafaynodeclasses/status"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  # Cluster capacity and workloads
+  # Cluster capacity and workloads (read only). configmaps: the headroom-policy ConfigMap.
   - apiGroups: [""]
-    resources: ["nodes", "nodes/status", "pods", "pods/eviction", "events", "persistentvolumes", "persistentvolumeclaims"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  - apiGroups: [""]
-    resources: ["namespaces", "configmaps", "secrets", "serviceaccounts"]
+    resources: ["nodes", "pods", "persistentvolumes", "persistentvolumeclaims", "namespaces", "replicationcontrollers", "podtemplates", "configmaps"]
     verbs: ["get", "list", "watch"]
+  # Node lifecycle: Karpenter taints/labels/finalizes nodes and deletes them when a NodeClaim terminates.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["patch", "update", "delete"]
+  # Drain (eviction API) and pod deletion (Karpenter's drain fallback; legacy headroom pause pods).
+  - apiGroups: [""]
+    resources: ["pods/eviction"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
   - apiGroups: ["apps"]
     resources: ["daemonsets", "replicasets", "statefulsets"]
     verbs: ["get", "list", "watch"]
@@ -44,10 +63,11 @@ rules:
       - storageclasses
       - csistoragecapacities
     verbs: ["get", "list", "watch"]
-  # Leader election
+  # Leases: read only. The manager caches kube-node-lease leases (node liveness) through a cluster-wide
+  # list with a namespace field selector, and reads its own election lease. Writes are in the Role below.
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -59,6 +79,41 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: karpenter-provider-rafay
+subjects:
+  - kind: ServiceAccount
+    name: karpenter-provider-rafay
+    namespace: rafay-system
+---
+# Leader-election Lease writes, confined to LEADER_ELECTION_NAMESPACE (namespace-karpenter-leader.yaml).
+# Create cannot be restricted by name; update/patch are limited to the election lease (LEADER_ELECTION_NAME,
+# default karpenter-leader-election) — widen resourceNames if you change that env var.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: karpenter-provider-rafay-leader-election
+  namespace: karpenter
+  labels:
+    app.kubernetes.io/name: karpenter-provider-rafay
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["create"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["karpenter-leader-election"]
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: karpenter-provider-rafay-leader-election
+  namespace: karpenter
+  labels:
+    app.kubernetes.io/name: karpenter-provider-rafay
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: karpenter-provider-rafay-leader-election
 subjects:
   - kind: ServiceAccount
     name: karpenter-provider-rafay

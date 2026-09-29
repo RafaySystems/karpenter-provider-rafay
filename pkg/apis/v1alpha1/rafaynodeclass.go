@@ -32,7 +32,9 @@ import (
 // The CRD's spec is a structural schema listing exactly these fields, so a stray
 // spec.clusterID is rejected by kubectl rather than silently ignored. Adding a field here
 // without adding it to config/crd/karpenter.rafay.io_rafaynodeclasses.yaml means the API
-// server prunes it before the controller ever sees it.
+// server prunes it before the controller ever sees it. That CRD and zz_generated.deepcopy.go
+// are hand-maintained (no controller-gen target — see the Makefile); the kubebuilder markers
+// below document intent and TestMsCRDSchemaMatchesGoTypes checks the CRD against them.
 type RafayNodeClassSpec struct {
 	// InstanceTypes define the node shapes available for provisioning.
 	// At least one entry is required; the provider returns an error if this list is empty.

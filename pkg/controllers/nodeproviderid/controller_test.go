@@ -31,6 +31,7 @@ import (
 
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 
+	"github.com/RafaySystems/karpenter-provider-rafay/pkg/apis/v1alpha1"
 	cprovider "github.com/RafaySystems/karpenter-provider-rafay/pkg/cloudprovider"
 )
 
@@ -69,7 +70,7 @@ func newNodeClaim(name, pool, sku, providerID string, created time.Time) *karpv1
 			NodeClassRef: &karpv1.NodeClassReference{
 				Kind:  "RafayNodeClass",
 				Name:  sku,
-				Group: "karpenter.rafay.dev",
+				Group: v1alpha1.Group,
 			},
 		},
 		Status: karpv1.NodeClaimStatus{
@@ -117,7 +118,7 @@ func getNodeClaim(t *testing.T, c client.Client, name string) *karpv1.NodeClaim 
 // results in the NodeClaim's Status.ProviderID being patched to the node's ProviderID.
 func TestReconcileHappyPath(t *testing.T) {
 	pendingID := cprovider.PendingProviderIDPrefix + "uid-a"
-	realID := "rafay://cluster-1/node-1"
+	realID := "rafay://pool-1/sku-1/node-1"
 
 	claim := newNodeClaim("claim-a", "pool-1", "sku-1", pendingID, baseTime)
 	node := newNode("node-1", "pool-1", "sku-1", realID, baseTime.Add(time.Minute))
@@ -144,7 +145,7 @@ func TestReconcileHappyPath(t *testing.T) {
 // non-pending NodeClaim must not be assigned to a pending claim.
 func TestReconcileSkipsNodeOwnedByAnotherClaim(t *testing.T) {
 	pendingID := cprovider.PendingProviderIDPrefix + "uid-a"
-	ownedID := "rafay://cluster-1/node-1"
+	ownedID := "rafay://pool-1/sku-1/node-1"
 
 	pendingClaim := newNodeClaim("claim-a", "pool-1", "sku-1", pendingID, baseTime)
 	ownerClaim := newNodeClaim("claim-b", "pool-1", "sku-1", ownedID, baseTime.Add(-time.Hour))
@@ -183,7 +184,7 @@ func TestReconcileIgnoresNodesCreatedBeforeOrAtClaim(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			claim := newNodeClaim("claim-a", "pool-1", "sku-1", pendingID, baseTime)
-			node := newNode("node-1", "pool-1", "sku-1", "rafay://cluster-1/node-1", tc.nodeCreated)
+			node := newNode("node-1", "pool-1", "sku-1", "rafay://pool-1/sku-1/node-1", tc.nodeCreated)
 
 			c := newTestClient(claim, node)
 			ctrl := newTestController(c)
@@ -208,11 +209,11 @@ func TestReconcileIgnoresNodesCreatedBeforeOrAtClaim(t *testing.T) {
 // 4. Non-pending or deleting NodeClaims are skipped without touching the node assignment.
 func TestReconcileSkipsNonPendingAndDeletingClaims(t *testing.T) {
 	t.Run("non-pending claim", func(t *testing.T) {
-		realID := "rafay://cluster-1/node-0"
+		realID := "rafay://pool-1/sku-1/node-0"
 		claim := newNodeClaim("claim-a", "pool-1", "sku-1", realID, baseTime)
 		// A matching, unclaimed node exists; it must NOT be assigned since the
 		// claim already has a real ProviderID.
-		node := newNode("node-1", "pool-1", "sku-1", "rafay://cluster-1/node-1", baseTime.Add(time.Minute))
+		node := newNode("node-1", "pool-1", "sku-1", "rafay://pool-1/sku-1/node-1", baseTime.Add(time.Minute))
 
 		c := newTestClient(claim, node)
 		ctrl := newTestController(c)
@@ -240,7 +241,7 @@ func TestReconcileSkipsNonPendingAndDeletingClaims(t *testing.T) {
 		claim.Finalizers = []string{"karpenter.sh/termination"}
 		now := metav1.NewTime(baseTime.Add(2 * time.Minute))
 		claim.DeletionTimestamp = &now
-		node := newNode("node-1", "pool-1", "sku-1", "rafay://cluster-1/node-1", baseTime.Add(time.Minute))
+		node := newNode("node-1", "pool-1", "sku-1", "rafay://pool-1/sku-1/node-1", baseTime.Add(time.Minute))
 
 		c := newTestClient(claim, node)
 		ctrl := newTestController(c)
@@ -361,14 +362,14 @@ func TestNodesToNodeClaims(t *testing.T) {
 	matching := newNodeClaim("claim-match", "pool-1", "sku-1", pendingID+"1", baseTime)
 	wrongPool := newNodeClaim("claim-wrong-pool", "pool-2", "sku-1", pendingID+"2", baseTime)
 	wrongSku := newNodeClaim("claim-wrong-sku", "pool-1", "sku-2", pendingID+"3", baseTime)
-	nonPending := newNodeClaim("claim-non-pending", "pool-1", "sku-1", "rafay://cluster-1/node-9", baseTime)
+	nonPending := newNodeClaim("claim-non-pending", "pool-1", "sku-1", "rafay://pool-1/sku-1/node-9", baseTime)
 	nilClassRef := newNodeClaim("claim-nil-classref", "pool-1", "sku-1", pendingID+"4", baseTime)
 	nilClassRef.Spec.NodeClassRef = nil
 
 	c := newTestClient(matching, wrongPool, wrongSku, nonPending, nilClassRef)
 	ctrl := newTestController(c)
 
-	node := newNode("node-1", "pool-1", "sku-1", "rafay://cluster-1/node-1", baseTime.Add(time.Minute))
+	node := newNode("node-1", "pool-1", "sku-1", "rafay://pool-1/sku-1/node-1", baseTime.Add(time.Minute))
 	requests := ctrl.nodesToNodeClaims(context.Background(), node)
 
 	if len(requests) != 1 {
@@ -379,7 +380,7 @@ func TestNodesToNodeClaims(t *testing.T) {
 	}
 
 	t.Run("node missing labels returns nil", func(t *testing.T) {
-		unlabeled := newNode("node-2", "", "", "rafay://cluster-1/node-2", baseTime.Add(time.Minute))
+		unlabeled := newNode("node-2", "", "", "rafay://pool-1/sku-1/node-2", baseTime.Add(time.Minute))
 		unlabeled.Labels = map[string]string{}
 		if got := ctrl.nodesToNodeClaims(context.Background(), unlabeled); got != nil {
 			t.Fatalf("expected nil requests for unlabeled node, got %+v", got)

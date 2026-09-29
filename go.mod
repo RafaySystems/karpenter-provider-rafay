@@ -157,4 +157,4 @@ replace (
 
 // Rafay fork of upstream v1.14.1 (branch rafay-release-v1.14.x): raises the NodeClaim registrationTimeout from 15m to 60m,
 // which upstream does not expose as a setting (kubernetes-sigs/karpenter#357). Pinned by commit pseudo-version.
-replace sigs.k8s.io/karpenter => github.com/RafaySystems/karpenter-rafay v1.14.2-0.20260923143313-91b1217179da
+replace sigs.k8s.io/karpenter => github.com/RafaySystems/karpenter-rafay v1.14.2-0.20260927084222-f05619ef36ff
