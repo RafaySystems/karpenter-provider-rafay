@@ -12,8 +12,8 @@ github.com/Pallinder/go-randomdata v1.2.0 h1:DZ41wBchNRb/0GfsePLiSwb0PHZmT67XY00
 github.com/Pallinder/go-randomdata v1.2.0/go.mod h1:yHmJgulpD2Nfrm0cR9tI/+oAgRqCQQixsA8HyRZfV9Y=
 github.com/RafaySystems/edge-common v1.24.1-0.20260915114827-491d0127017b h1:Hb+yU1rSs9buU83mmCy0LJ118ba93HLl6t14ecCUOd0=
 github.com/RafaySystems/edge-common v1.24.1-0.20260915114827-491d0127017b/go.mod h1:v9mRVH67dWyPtPrgK9Z1yQuJ+FiMuPacu3sf2y7PFEI=
-github.com/RafaySystems/karpenter-rafay v1.14.2-0.20260923143313-91b1217179da h1:T7V8Q98uMI2gPy+o/xfL6NgfZBwoE6f13k8eScLIcXg=
-github.com/RafaySystems/karpenter-rafay v1.14.2-0.20260923143313-91b1217179da/go.mod h1:QO5XveQPGfYh3YEaHEq7Pycy5wyaDMcyl5oyYcjjWwo=
+github.com/RafaySystems/karpenter-rafay v1.14.2-0.20260927084222-f05619ef36ff h1:35T1gelQAbOdV6jZoemLa9uWaVk1yuAhALP0MDL2WYw=
+github.com/RafaySystems/karpenter-rafay v1.14.2-0.20260927084222-f05619ef36ff/go.mod h1:QO5XveQPGfYh3YEaHEq7Pycy5wyaDMcyl5oyYcjjWwo=
 github.com/RafaySystems/rafay-common v1.29.1-rc2.0.20260410104646-fc29d759c89d h1:M1DutRtBq/9H9ViJNUhPglc9oDpp8IKSiVmVSWFjPgg=
 github.com/RafaySystems/rafay-common v1.29.1-rc2.0.20260410104646-fc29d759c89d/go.mod h1:ZXaf4Q7DqoJxIRKdraJsT3upt16T05Qy8Vt0/6dT3WE=
 github.com/RoaringBitmap/roaring v1.9.4 h1:yhEIoH4YezLYT04s1nHehNO64EKFTop/wBhxv2QzDdQ=

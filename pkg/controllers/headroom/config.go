@@ -19,12 +19,14 @@ package headroom
 import (
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/yaml"
 )
@@ -35,6 +37,15 @@ const (
 	// so preempting one pod frees a predictable amount of capacity.
 	defaultPodCPU    = "500m"
 	defaultPodMemory = "512Mi"
+
+	// maxBufferPercent bounds every buffer fraction. The buffer is a fraction f of the pool's
+	// TOTAL allocatable, and every node also carries a DaemonSet/system share d, so the pool
+	// only settles once N >= workload / (C × (1 - f - d)): with f >= 1 - d there is no fixed
+	// point at all (each new node adds as much pause-pod demand as capacity, one pod is always
+	// Pending, and Karpenter provisions until the NodePool limits stop it), and the effective
+	// buffer relative to the real workload is f/(1-f-d) in any case. 50% keeps a fixed point for
+	// any realistic overhead and still allows a buffer larger than the workload itself.
+	maxBufferPercent = 50.0
 
 	// minPodCPU / minPodMemory are the smallest per-pod slices we accept. The per-pod size is
 	// the divisor of the replica math, so a typo that makes it absurdly small (podCPU: 100u)
@@ -83,7 +94,12 @@ type poolPolicyYAML struct {
 	GPU    string `json:"gpu"`
 	PodGPU string `json:"podGPU"`
 
-	MinPods     int              `json:"minPods"`
+	MinPods int `json:"minPods"`
+	// MaxPods optionally caps the replica count. The buffer is sized from total pool
+	// allocatable, which includes the nodes the buffer itself caused to be provisioned, so
+	// without a ceiling a large pool carries a proportionally large buffer; maxPods bounds it
+	// absolutely (0 / unset = no ceiling beyond maxHeadroomReplicas).
+	MaxPods     int              `json:"maxPods"`
 	Tolerations []tolerationYAML `json:"tolerations"`
 }
 
@@ -108,6 +124,9 @@ type parsedPoolPolicy struct {
 
 	// MinPods is the replica floor even when the pool has no ready nodes (cold start).
 	MinPods int
+	// MaxPods is the replica ceiling; 0 means none (beyond maxHeadroomReplicas). When set it
+	// is >= MinPods (validated at parse time).
+	MaxPods int
 
 	Tolerations []corev1.Toleration
 }
@@ -124,18 +143,47 @@ type parsedPoolPolicy struct {
 //     → (nil, error). A YAML typo must NOT read as "no pools configured", or a single bad
 //     character would GC every headroom Deployment in the cluster (fail-open). Reconcile
 //     short-circuits on this error before any cleanup runs.
+//   - A key that is not one of the well-known ones and does not hold a YAML mapping (free text
+//     such as a README or maintenance note, a bare bool or number) can never declare pools, so
+//     it is not a candidate at all: it is skipped, never an error. Otherwise an unrelated key
+//     sharing the ConfigMap would make the legitimate `pools: []` unreachable. The well-known
+//     keys stay fail-closed whatever they hold.
+//   - A fallback key that is not even well-formed YAML (a note with colons, `Owner: x, reason: y`)
+//     cannot be told from a typo by the parser. It is fail-closed on its own, but once a
+//     well-known key has parsed cleanly it cannot legitimately be the policy, so it is skipped
+//     with a warning instead: failing on it would leave a real `pools: []` unreachable, and the
+//     buffer Deployments up, for as long as the note exists. A parse error on a well-known key
+//     itself always fails closed.
 func parseHeadroomConfig(cm *corev1.ConfigMap) ([]parsedPoolPolicy, error) {
 	var (
 		pools   []parsedPoolPolicy
 		fromKey string
 		errs    []error
+		// skipped are the fallback keys that failed to parse; cleanKey is the first well-known key
+		// that parsed cleanly (pools or not) and wellKnownErr whether any well-known key failed.
+		skipped      []string
+		cleanKey     string
+		wellKnownErr bool
 	)
 	for _, key := range candidateKeys(cm.Data) {
+		wellKnown := isWellKnownKey(key)
+		if !wellKnown && isNonMappingYAML(cm.Data[key]) {
+			klog.V(2).Infof("headroom: configmap %s/%s key %q is not a YAML mapping; ignoring it", cm.Namespace, cm.Name, key)
+			continue
+		}
 		got, err := unmarshalPools(cm.Data[key])
 		if err != nil {
 			klog.Warningf("headroom: configmap %s/%s key %q: %v", cm.Namespace, cm.Name, key, err)
 			errs = append(errs, fmt.Errorf("key %q: %w", key, err))
+			if wellKnown {
+				wellKnownErr = true
+			} else {
+				skipped = append(skipped, key)
+			}
 			continue
+		}
+		if wellKnown && cleanKey == "" {
+			cleanKey = key
 		}
 		if len(got) == 0 {
 			continue
@@ -153,6 +201,13 @@ func parseHeadroomConfig(cm *corev1.ConfigMap) ([]parsedPoolPolicy, error) {
 		return pools, nil
 	}
 	if len(errs) > 0 {
+		if cleanKey != "" && !wellKnownErr {
+			for _, key := range skipped {
+				klog.Warningf("headroom: configmap %s/%s key %q is not valid YAML; ignoring it because %q parsed cleanly",
+					cm.Namespace, cm.Name, key, cleanKey)
+			}
+			return nil, nil
+		}
 		return nil, fmt.Errorf("configmap %s/%s: no data key yields a valid pools list: %w",
 			cm.Namespace, cm.Name, errors.Join(errs...))
 	}
@@ -191,6 +246,22 @@ func isWellKnownKey(key string) bool {
 	return false
 }
 
+// isNonMappingYAML reports whether data is well-formed YAML whose top level is a scalar or a
+// list — a document that can never carry a `pools` key. Malformed YAML returns false so that
+// it still reaches unmarshalPools and fails closed (a typo in a fallback policy key must not
+// silently read as "no pools").
+func isNonMappingYAML(data string) bool {
+	var v any
+	if err := yaml.Unmarshal([]byte(data), &v); err != nil {
+		return false
+	}
+	switch v.(type) {
+	case nil, map[string]any:
+		return false
+	}
+	return true
+}
+
 func unmarshalPools(data string) ([]parsedPoolPolicy, error) {
 	var raw headroomPolicyYAML
 	if err := yaml.Unmarshal([]byte(data), &raw); err != nil {
@@ -210,7 +281,12 @@ func unmarshalPools(data string) ([]parsedPoolPolicy, error) {
 			return nil, fmt.Errorf("pool %q: duplicate pool name", p.Name)
 		}
 		seen[p.Name] = true
-		parsed := parsedPoolPolicy{Name: p.Name, MinPods: p.MinPods}
+		// The name becomes the Deployment name suffix and a label value; anything that is not
+		// a DNS label is rejected by the API server on every apply, so refuse it here.
+		if msgs := validation.IsDNS1123Label(p.Name); len(msgs) > 0 {
+			return nil, fmt.Errorf("pool %q name: %s", p.Name, strings.Join(msgs, "; "))
+		}
+		parsed := parsedPoolPolicy{Name: p.Name, MinPods: p.MinPods, MaxPods: p.MaxPods}
 		var err error
 		if parsed.CPU, err = parsePercent(p.CPU); err != nil {
 			return nil, fmt.Errorf("pool %q cpu: %w", p.Name, err)
@@ -241,8 +317,18 @@ func unmarshalPools(data string) ([]parsedPoolPolicy, error) {
 		if parsed.PodGPU.Sign() < 0 {
 			return nil, fmt.Errorf("pool %q podGPU: must be >= 0, got %q", p.Name, parsed.PodGPU.String())
 		}
+		// Extended resources are integral: the API server rejects a fractional GPU request.
+		if parsed.PodGPU.MilliValue()%1000 != 0 {
+			return nil, fmt.Errorf("pool %q podGPU: must be a whole number of devices, got %q", p.Name, parsed.PodGPU.String())
+		}
 		if p.MinPods < 0 {
 			return nil, fmt.Errorf("pool %q minPods: must be >= 0, got %d", p.Name, p.MinPods)
+		}
+		if p.MaxPods < 0 {
+			return nil, fmt.Errorf("pool %q maxPods: must be >= 0, got %d", p.Name, p.MaxPods)
+		}
+		if p.MaxPods > 0 && p.MaxPods < p.MinPods {
+			return nil, fmt.Errorf("pool %q maxPods: must be >= minPods (%d), got %d", p.Name, p.MinPods, p.MaxPods)
 		}
 		if parsed.Tolerations, err = parseTolerations(p.Tolerations); err != nil {
 			return nil, fmt.Errorf("pool %q tolerations: %w", p.Name, err)
@@ -262,8 +348,15 @@ func parsePercent(s string) (float64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("invalid percent %q: %w", s, err)
 	}
-	if v < 0 || v > 100 {
-		return 0, fmt.Errorf("percent %q out of range [0, 100]", s)
+	// ParseFloat accepts "NaN", which fails both range comparisons and would silently size
+	// the buffer to zero.
+	if math.IsNaN(v) {
+		return 0, fmt.Errorf("invalid percent %q: not a number", s)
+	}
+	if v < 0 || v > maxBufferPercent {
+		return 0, fmt.Errorf("percent %q out of range [0, %g]: the buffer is a fraction of total pool allocatable, "+
+			"so a larger fraction cannot converge once DaemonSet overhead is counted (effective buffer is f/(1-f-d))",
+			s, maxBufferPercent)
 	}
 	return v / 100.0, nil
 }
@@ -286,7 +379,12 @@ func parseQuantity(s, def string) (resource.Quantity, error) {
 }
 
 // parseTolerations converts ConfigMap toleration entries to corev1.Tolerations,
-// validating that operator and effect carry only values the scheduler understands.
+// validating that operator and effect carry only values the scheduler understands, that a
+// non-empty key is a qualified name (the API server runs IsQualifiedName on every toleration
+// key: a trailing space from a YAML edit or an embedded space is a 422), and the cross-field
+// combinations the API server enforces (an Exists toleration carries no value; an Equal one —
+// the default when operator is empty — needs a key). A combination the API server would reject
+// must fail here, or the pool's Deployment fails on every apply.
 func parseTolerations(in []tolerationYAML) ([]corev1.Toleration, error) {
 	if len(in) == 0 {
 		return nil, nil
@@ -294,9 +392,21 @@ func parseTolerations(in []tolerationYAML) ([]corev1.Toleration, error) {
 	out := make([]corev1.Toleration, 0, len(in))
 	for i, t := range in {
 		switch corev1.TolerationOperator(t.Operator) {
-		case "", corev1.TolerationOpExists, corev1.TolerationOpEqual:
+		case corev1.TolerationOpExists:
+			if t.Value != "" {
+				return nil, fmt.Errorf("entry %d: value must be empty when operator is Exists", i)
+			}
+		case "", corev1.TolerationOpEqual:
+			if t.Key == "" {
+				return nil, fmt.Errorf("entry %d: key must be set unless operator is Exists", i)
+			}
 		default:
 			return nil, fmt.Errorf("entry %d: invalid operator %q", i, t.Operator)
+		}
+		if t.Key != "" {
+			if msgs := validation.IsQualifiedName(t.Key); len(msgs) > 0 {
+				return nil, fmt.Errorf("entry %d: key %q: %s", i, t.Key, strings.Join(msgs, "; "))
+			}
 		}
 		switch corev1.TaintEffect(t.Effect) {
 		case "", corev1.TaintEffectNoSchedule, corev1.TaintEffectPreferNoSchedule, corev1.TaintEffectNoExecute:

@@ -34,8 +34,8 @@ package rafay
 // Note on Send errors: per the gRPC contract, SendMsg on a stream whose transport has broken
 // returns a bare io.EOF — the real status (e.g. codes.Unavailable) is only obtainable from
 // Recv. Every helper below therefore calls Recv after a failed Send and returns that status
-// instead, so shouldRedial() can recognise Unavailable and drive the redial/closeConn recovery
-// path (and so callers see a meaningful error rather than "EOF").
+// instead, so shouldRedial() can recognise Unavailable and drive callBroker's single retry
+// (and so callers see a meaningful error rather than "EOF").
 
 import (
 	"context"

@@ -45,9 +45,9 @@ package rafay
 //   so a single removal cannot flood the broker's (global, 64-slot) queue with hundreds of copies.
 //
 // Cancellation:
-//   Cancel(operationID) sends a best-effort, fire-and-forget cancel to the broker. Only
-//   operations still queued (ACCEPTED) at the broker are cancelled; RUNNING or terminal
-//   operations are untouched.
+//   Cancel(operationID) asks the broker to cancel an operation and reports whether it was
+//   applied. Only operations still queued (ACCEPTED) at the broker are cancelled; RUNNING or
+//   terminal operations are untouched.
 //
 // Deduplication:
 //   Enqueue/EnqueueRemove are idempotent per operationID. If Create()/Delete() is cancelled and
@@ -71,13 +71,26 @@ const (
 	defaultMaxBatchSize  = 10
 	defaultBatchWindow   = 10 * time.Second
 	defaultPollInterval  = 30 * time.Second
-	defaultInitialDelay  = 120 * time.Second // wait before first poll after a batch is sent
 	batchItemQueueBuffer = 256
+
+	// There is deliberately no initial delay before the first status poll of a batch: every batch
+	// is polled on the next ticker tick after its ACK, whatever its kind. A remove's SUCCEEDED
+	// tombstone is written the moment the catalog decrement is published (seconds after ACK) and
+	// Delete() converges only once the poller has seen it. An add's permanent refusal ("pool at
+	// maximum", "pool not found", ...) is decided when the broker claims the batch — seconds after
+	// ACK on an idle edge, since the broker runs one batch at a time per edge — and the failure
+	// handler's pool hold and NodeClaim replacement must follow within one poll interval, or the
+	// refused pool keeps taking new NodeClaims meanwhile. A node that takes up to 60 minutes to
+	// land costs a few read-only polls that report nothing terminal; that is cheaper than a
+	// 2-minute blind spot on every refusal.
 
 	// maxBatchAge bounds how long a sent batch is tracked by the status poller. Result channels
 	// were already resolved at ACK; items still unresolved at the broker after this long are
-	// treated as expired (failure handler invoked, batch dropped).
-	maxBatchAge = 2 * time.Hour
+	// treated as expired (failure handler invoked, batch dropped). Adding a node can take up to
+	// 60 minutes and the broker's own add-processing deadline is longer still, so this must stay
+	// comfortably above both — an add that is merely slow must never be reported as FAILED (which
+	// deletes the pending NodeClaim). Never shorten it.
+	maxBatchAge = 3 * time.Hour
 
 	// maxConsecutiveEmptyPolls is how many empty status responses in a row mark a batch as
 	// unknown/expired at the broker (the broker replies with an empty result list instead of an
@@ -152,7 +165,6 @@ type inProgressBatch struct {
 	kind       string // opKindAdd or opKindRemove
 	items      []batchItem
 	sentAt     time.Time // when the broker ACKed the batch; used for max-age expiry
-	pollAfter  time.Time // don't poll until this time (initial delay)
 	emptyPolls int       // consecutive status polls that returned no results (unknown/expired at broker)
 }
 
@@ -165,7 +177,6 @@ type NodeBatcher struct {
 	maxBatchSize int
 	batchWindow  time.Duration
 	pollInterval time.Duration
-	initialDelay time.Duration
 
 	// mu guards inProgress, inFlight and succeeded.
 	mu         sync.Mutex
@@ -187,15 +198,21 @@ type NodeBatcher struct {
 	// succeeded records operationIDs the broker reported SUCCEEDED, with the time observed.
 	// Delete() consults this to decide when a node removal has actually completed (see Succeeded).
 	// Entries are pruned after succeededRetention.
-	succeeded map[string]time.Time
+	succeeded map[string]succeededResult
 
 	// pendingMu guards pending. pending maps operationID → the result channels of every caller
 	// currently waiting on that operation. Only the first caller for an operationID enqueues a
 	// batchItem; retries and concurrent callers register another channel and are all resolved
 	// together, so no waiter can be left blocked on a channel that was already drained.
-	// Lock order when both locks are needed: mu → pendingMu.
+	// Lock order when both locks are needed: mu → pendingMu. enqueueItem and registerAndAck hold
+	// mu across their pendingMu section so an enqueue can never interleave with the ACK of the
+	// same operation (see enqueueItem).
 	pendingMu sync.Mutex
 	pending   map[string][]chan BatchResult
+
+	// newTimer starts the batch-window timer in collectBatch. It exists so tests can substitute a
+	// manual timer and close the window deterministically; production uses newWallTimer.
+	newTimer func(d time.Duration) (<-chan time.Time, func())
 
 	// failureMu guards failureHandler, which is invoked from the status poller goroutine on
 	// terminal FAILED results and on batch expiry.
@@ -211,13 +228,19 @@ func NewNodeBatcher(client *BrokerClient) *NodeBatcher {
 		maxBatchSize: defaultMaxBatchSize,
 		batchWindow:  defaultBatchWindow,
 		pollInterval: defaultPollInterval,
-		initialDelay: defaultInitialDelay,
 		inProgress:   make(map[string]*inProgressBatch),
 		inFlight:     make(map[string]struct{}),
 		opBatch:      make(map[string]string),
-		succeeded:    make(map[string]time.Time),
+		succeeded:    make(map[string]succeededResult),
 		pending:      make(map[string][]chan BatchResult),
+		newTimer:     newWallTimer,
 	}
+}
+
+// newWallTimer is the production newTimer: a time.Timer whose stop function releases it.
+func newWallTimer(d time.Duration) (<-chan time.Time, func()) {
+	t := time.NewTimer(d)
+	return t.C, func() { t.Stop() }
 }
 
 // Succeeded reports whether the broker has confirmed operationID reached SUCCEEDED.
@@ -231,6 +254,27 @@ func (b *NodeBatcher) Succeeded(operationID string) bool {
 	defer b.mu.Unlock()
 	_, ok := b.succeeded[operationID]
 	return ok
+}
+
+// succeededResult is what the poller records for a SUCCEEDED operation: when it was observed
+// (for retention) plus the broker's detail and provider IDs, which Delete() consults to tell a
+// real retirement from a clamped one ("node not retired").
+type succeededResult struct {
+	at          time.Time
+	detail      string
+	providerIDs []string
+}
+
+// SucceededResult returns the broker's detail and provider IDs for a SUCCEEDED operation, and
+// ok=false when the operation has not been observed SUCCEEDED (or was pruned).
+func (b *NodeBatcher) SucceededResult(operationID string) (providerIDs []string, detail string, ok bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	r, ok := b.succeeded[operationID]
+	if !ok {
+		return nil, "", false
+	}
+	return append([]string(nil), r.providerIDs...), r.detail, true
 }
 
 // Tracking reports whether the status poller is currently following batchID. It exists for
@@ -277,24 +321,30 @@ func (b *NodeBatcher) EnqueueRemove(operationID string, req RemoveNodesRequest) 
 // enqueueItem registers the caller as a waiter on item.operationID and, if this is the first
 // waiter and the operation is not already in flight at the broker, queues a batchItem for it.
 //
-// The insert-then-queue-send sequence runs under a single pendingMu acquisition, so a concurrent
-// dedup hit can never observe the map entry of a rolled-back (queue-full) item. The queue send is
-// non-blocking (select/default), so holding the lock cannot deadlock.
+// The in-flight check, the pending insert and the queue send all run under b.mu, with pendingMu
+// nested inside it (the declared lock order), and registerAndAck marks a batch in flight and
+// resolves its waiters under the same b.mu. Enqueues for one operationID are therefore serialised
+// against its ACK: a caller either joins the waiters the ACK resolves, or it sees the operation
+// in flight and is short-circuited — it can never miss both and queue a duplicate batch. That
+// matters because Karpenter calls Delete() for one NodeClaim from two controllers and Create()
+// retries a cancelled call, so concurrent enqueues for one operationID do happen.
+//
+// Holding pendingMu across the queue send also means a concurrent dedup hit can never observe
+// the map entry of a rolled-back (queue-full) item. The queue send is non-blocking
+// (select/default), so holding the locks cannot deadlock.
 func (b *NodeBatcher) enqueueItem(item batchItem) <-chan BatchResult {
 	ch := make(chan BatchResult, 1)
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
 
 	// Already ACKed by the broker and awaiting a terminal status: the caller's contract ("queued
 	// at the broker") is satisfied, so resolve immediately rather than sending a duplicate batch.
 	// Karpenter calls Delete() every 5s for the entire life of a removal, so without this each
 	// reconcile would push another remove batch onto the broker's queue.
-	// Lock order: mu → pendingMu (mu is released before pendingMu is taken below).
-	b.mu.Lock()
-	_, inFlight := b.inFlight[item.operationID]
-	batchID := b.opBatch[item.operationID]
-	b.mu.Unlock()
-	if inFlight {
+	if _, inFlight := b.inFlight[item.operationID]; inFlight {
 		klog.V(4).Infof("batcher: operationID=%s already in flight at broker — not re-sending", item.operationID)
-		ch <- BatchResult{BatchID: batchID, Duplicate: true}
+		ch <- BatchResult{BatchID: b.opBatch[item.operationID], Duplicate: true}
 		return ch
 	}
 
@@ -326,7 +376,8 @@ func (b *NodeBatcher) enqueueItem(item batchItem) <-chan BatchResult {
 // The pending entry is removed BEFORE the results are delivered: once a waiter consumes its
 // result, a fast retry for the same operationID must not join a waiter list that is already being
 // drained — it must start fresh instead. Each waiter channel is buffered (cap 1) and written
-// exactly once, so delivery never blocks.
+// exactly once, so delivery never blocks — which is what lets registerAndAck call this while
+// holding b.mu.
 func (b *NodeBatcher) resolvePending(operationID string, result BatchResult) {
 	b.pendingMu.Lock()
 	waiters := b.pending[operationID]
@@ -344,24 +395,25 @@ func (b *NodeBatcher) Run(ctx context.Context) {
 	b.statusPoller(ctx)
 }
 
-// Cancel sends a best-effort, fire-and-forget cancellation for operationID to the broker and
-// returns immediately. Only operations still queued (ACCEPTED) at the broker are cancelled;
-// RUNNING or terminal operations are untouched. Errors are logged only.
-func (b *NodeBatcher) Cancel(ctx context.Context, operationID string) {
-	go func() {
-		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cancelTimeout)
-		defer cancel()
-		cancelled, err := b.client.CancelOperations(cctx, []string{operationID})
-		if err != nil {
-			klog.Warningf("batcher: cancel operationID=%s failed: %v", operationID, err)
-			return
-		}
-		if len(cancelled) == 0 {
-			klog.Infof("batcher: cancel operationID=%s — operation no longer cancellable (running or finished)", operationID)
-			return
-		}
-		klog.Infof("batcher: cancelled operationID=%s at broker", operationID)
-	}()
+// Cancel asks the broker to cancel operationID and reports the outcome. Only operations still
+// queued (ACCEPTED) at the broker are cancelled; for a RUNNING or terminal operation the broker
+// answers with an empty list and applied is false — the caller must then assume the platform
+// write is (or will be) committed. The call is bounded by cancelTimeout and detached from the
+// caller's cancellation so a reconcile that gives up does not leave the broker's answer unread.
+func (b *NodeBatcher) Cancel(ctx context.Context, operationID string) (applied bool, err error) {
+	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cancelTimeout)
+	defer cancel()
+	cancelled, err := b.client.CancelOperations(cctx, []string{operationID})
+	if err != nil {
+		klog.Warningf("batcher: cancel operationID=%s failed: %v", operationID, err)
+		return false, err
+	}
+	if len(cancelled) == 0 {
+		klog.Infof("batcher: cancel operationID=%s — operation no longer cancellable (running or finished)", operationID)
+		return false, nil
+	}
+	klog.Infof("batcher: cancelled operationID=%s at broker", operationID)
+	return true, nil
 }
 
 // ──────────────────────── batch sender goroutine ──────────────────────────
@@ -399,8 +451,8 @@ func (b *NodeBatcher) collectBatch(ctx context.Context) []batchItem {
 		return batch
 	}
 
-	timer := time.NewTimer(b.batchWindow)
-	defer timer.Stop()
+	window, stop := b.newTimer(b.batchWindow)
+	defer stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -413,7 +465,7 @@ func (b *NodeBatcher) collectBatch(ctx context.Context) []batchItem {
 			if len(batch) >= b.maxBatchSize {
 				return batch
 			}
-		case <-timer.C:
+		case <-window:
 			return batch
 		}
 	}
@@ -499,22 +551,26 @@ func (b *NodeBatcher) registerAndAck(kind, batchID string, batch []batchItem) {
 	klog.Infof("batcher: sent %s batch batchID=%s nodeCount=%d", kind, batchID, len(batch))
 
 	now := time.Now()
+
 	b.mu.Lock()
+	defer b.mu.Unlock()
+	// Polled on the next ticker tick whatever the kind: there is no initial delay (see the
+	// constants block for why).
 	b.inProgress[batchID] = &inProgressBatch{
-		batchID:   batchID,
-		kind:      kind,
-		items:     batch,
-		sentAt:    now,
-		pollAfter: now.Add(b.initialDelay),
+		batchID: batchID,
+		kind:    kind,
+		items:   batch,
+		sentAt:  now,
 	}
-	// Mark in-flight before resolving the waiters, so a retry that lands immediately after a
-	// caller returns sees the operation as in flight and does not re-send it.
+	// Mark in flight and resolve the waiters under ONE hold of b.mu: enqueueItem checks in-flight
+	// and registers its waiter under the same lock, so a concurrent enqueue for one of these
+	// operations either already joined the waiters resolved below or will be short-circuited as
+	// in flight afterwards — it cannot slip between the two steps and queue a duplicate batch.
+	// Waiter channels are buffered (cap 1) and written once, so resolving never blocks here.
 	for _, item := range batch {
 		b.inFlight[item.operationID] = struct{}{}
 		b.opBatch[item.operationID] = batchID
 	}
-	b.mu.Unlock()
-
 	for _, item := range batch {
 		b.resolvePending(item.operationID, BatchResult{BatchID: batchID})
 	}
@@ -526,9 +582,9 @@ func (b *NodeBatcher) registerAndAck(kind, batchID string, batch []batchItem) {
 //
 // Polling needs only the operation IDs and the kind: terminal states are reported per operation
 // ID and FAILED ones go to the failure handler by kind. The request payloads that built the
-// original batch died with the old process and are not required. The batch is polled without the
-// initial delay (it was sent long ago) and its max-age clock restarts from now, since the original
-// send time is not persisted — the broker's 90-minute batch index is the tighter bound anyway.
+// original batch died with the old process and are not required. The batch is polled on the next
+// tick like any other and its max-age clock restarts from now, since the original send time is not
+// persisted — the broker's own batch index TTL bounds it independently.
 //
 // Only adds are resumable on purpose. A remove needs no resume: Karpenter re-issues Delete() every
 // few seconds with the same deterministic operation ID, the broker answers from its tombstone, and
@@ -557,11 +613,10 @@ func (b *NodeBatcher) ResumeAddBatch(batchID string, operationIDs []string) bool
 		return false
 	}
 	b.inProgress[batchID] = &inProgressBatch{
-		batchID:   batchID,
-		kind:      opKindAdd,
-		items:     items,
-		sentAt:    now,
-		pollAfter: now,
+		batchID: batchID,
+		kind:    opKindAdd,
+		items:   items,
+		sentAt:  now,
 	}
 	for _, item := range items {
 		b.inFlight[item.operationID] = struct{}{}
@@ -571,18 +626,27 @@ func (b *NodeBatcher) ResumeAddBatch(batchID string, operationIDs []string) bool
 	return true
 }
 
-// clearInFlight drops operationIDs from the in-flight set. Callers must hold b.mu.
+// clearOpLocked drops one operationID from the in-flight set and from opBatch, which is kept in
+// step with it. Every path on which an operation leaves the in-flight state goes through here.
+// Callers must hold b.mu.
+func (b *NodeBatcher) clearOpLocked(operationID string) {
+	delete(b.inFlight, operationID)
+	delete(b.opBatch, operationID)
+}
+
+// clearInFlightLocked drops every item's operationID from the in-flight set (and opBatch).
+// Callers must hold b.mu.
 func (b *NodeBatcher) clearInFlightLocked(items []batchItem) {
 	for _, item := range items {
-		delete(b.inFlight, item.operationID)
-		delete(b.opBatch, item.operationID)
+		b.clearOpLocked(item.operationID)
 	}
 }
 
-// pruneSucceededLocked bounds the succeeded set. Callers must hold b.mu.
+// pruneSucceededLocked bounds the succeeded set. It runs once per poller tick from pollAll, so
+// retention holds whether or not any batch is being polled. Callers must hold b.mu.
 func (b *NodeBatcher) pruneSucceededLocked(now time.Time) {
-	for opID, at := range b.succeeded {
-		if now.Sub(at) > succeededRetention {
+	for opID, r := range b.succeeded {
+		if now.Sub(r.at) > succeededRetention {
 			delete(b.succeeded, opID)
 		}
 	}
@@ -605,6 +669,10 @@ func (b *NodeBatcher) statusPoller(ctx context.Context) {
 
 func (b *NodeBatcher) pollAll(ctx context.Context) {
 	b.mu.Lock()
+	// Retention is driven by the ticker, not by the presence of a pollable batch: a cluster that
+	// scales in a burst and then goes quiet must not keep the burst's SUCCEEDED entries past
+	// succeededRetention.
+	b.pruneSucceededLocked(time.Now())
 	batchIDs := make([]string, 0, len(b.inProgress))
 	for id := range b.inProgress {
 		batchIDs = append(batchIDs, id)
@@ -620,11 +688,6 @@ func (b *NodeBatcher) pollBatch(ctx context.Context, batchID string) {
 	b.mu.Lock()
 	bp, ok := b.inProgress[batchID]
 	if !ok {
-		b.mu.Unlock()
-		return
-	}
-	// Respect initial delay before first poll.
-	if time.Now().Before(bp.pollAfter) {
 		b.mu.Unlock()
 		return
 	}
@@ -706,21 +769,20 @@ func (b *NodeBatcher) pollBatch(ctx context.Context, batchID string) {
 			klog.Infof("batcher: node %s succeeded operationID=%s providerID=%s", bp.kind, item.operationID, pid)
 			// Record the completion so Delete() can report a finished removal to Karpenter as
 			// NodeClaimNotFound — the signal that releases the node's termination finalizer.
-			b.succeeded[item.operationID] = now
-			delete(b.inFlight, item.operationID)
+			b.succeeded[item.operationID] = succeededResult{at: now, detail: nr.GetDetail(), providerIDs: append([]string(nil), nr.GetProviderIds()...)}
+			b.clearOpLocked(item.operationID)
 		case v1.KARPENTER_NODE_OPERATION_STATE_FAILED:
 			klog.Warningf("batcher: node %s failed operationID=%s: %s", bp.kind, item.operationID, nr.GetDetail())
 			failed = append(failed, failedOp{operationID: item.operationID, detail: nr.GetDetail()})
 			// Not in flight any more: a retry (Karpenter re-invoking Delete, or a fresh Create)
 			// must be able to re-send this operation.
-			delete(b.inFlight, item.operationID)
+			b.clearOpLocked(item.operationID)
 		default:
 			// ACCEPTED or RUNNING — not done yet.
 			allDone = false
 			remaining = append(remaining, item)
 		}
 	}
-	b.pruneSucceededLocked(now)
 
 	if allDone || len(remaining) == 0 {
 		delete(b.inProgress, batchID)

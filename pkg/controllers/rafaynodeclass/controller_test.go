@@ -120,8 +120,10 @@ func TestReconcileUnparseableCPUSetsReadyFalse(t *testing.T) {
 	}
 }
 
-// TestReconcileIsIdempotent re-reconciles an already-Ready NodeClass and verifies no error and
-// an unchanged condition (the controller skips patching when nothing changed).
+// TestReconcileIsIdempotent re-reconciles an already-Ready NodeClass and verifies no error, an
+// unchanged condition, and — the point of the test — that the second pass issued no status
+// patch: with MaxConcurrentReconciles 10 a controller that patched every time would write on
+// every reconcile (R1-test-quality-9; the patch count is what proves the `!changed` early return).
 func TestReconcileIsIdempotent(t *testing.T) {
 	nc := &v1alpha1.RafayNodeClass{
 		ObjectMeta: metav1.ObjectMeta{Name: "idempotent"},
@@ -131,25 +133,24 @@ func TestReconcileIsIdempotent(t *testing.T) {
 			},
 		},
 	}
-	cl := fake.NewClientBuilder().
-		WithScheme(newTestScheme(t)).
-		WithObjects(nc).
-		WithStatusSubresource(&v1alpha1.RafayNodeClass{}).
-		Build()
-	c := NewController(cl)
+	pc := msNewStatusPatchCounter(t, nc)
+	c := NewController(pc)
 
 	for i := 0; i < 2; i++ {
 		var current v1alpha1.RafayNodeClass
-		if err := cl.Get(context.Background(), client.ObjectKey{Name: nc.Name}, &current); err != nil {
+		if err := pc.Get(context.Background(), client.ObjectKey{Name: nc.Name}, &current); err != nil {
 			t.Fatalf("get RafayNodeClass: %v", err)
 		}
 		if _, err := c.Reconcile(context.Background(), &current); err != nil {
 			t.Fatalf("Reconcile #%d: unexpected error: %v", i+1, err)
 		}
 	}
+	if pc.patches != 1 {
+		t.Fatalf("status patches across two reconciles = %d, want exactly 1 (the second pass must skip the patch)", pc.patches)
+	}
 
 	var out v1alpha1.RafayNodeClass
-	if err := cl.Get(context.Background(), client.ObjectKey{Name: nc.Name}, &out); err != nil {
+	if err := pc.Get(context.Background(), client.ObjectKey{Name: nc.Name}, &out); err != nil {
 		t.Fatalf("get RafayNodeClass: %v", err)
 	}
 	if cond := readyCondition(t, &out); cond.Status != metav1.ConditionTrue {

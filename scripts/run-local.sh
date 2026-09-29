@@ -5,7 +5,9 @@
 set -e
 cd "$(dirname "$0")/.."
 
-export KARPENTER_DISABLE_LEADER_ELECTION=true
+# The Karpenter fork reads DISABLE_LEADER_ELECTION verbatim (no KARPENTER_ prefix); leaving election on
+# out-of-cluster fails in NewManager with "unable to find leader election namespace".
+export DISABLE_LEADER_ELECTION=true
 
 : "${EDGE_CLIENT_CERT_FOLDER:=${CERT_FOLDER:-}}"
 if [ -z "$EDGE_CLIENT_CERT_FOLDER" ]; then

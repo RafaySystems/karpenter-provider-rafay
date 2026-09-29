@@ -119,9 +119,12 @@ on every master would only race the same objects.
 3. `kubectl wait --for=condition=Established` on them — Karpenter registers a field index on
    `status.providerID` at start-up, which only works once the NodeClaim CRD is established.
    Waiting here avoids a crash-loop-then-restart cycle.
-4. Apply the `karpenter` namespace (leader-election Leases only — the Rafay drift webhook rejects
-   Lease writes in `rafay-system`)
-5. Apply ServiceAccount + ClusterRole/Binding
+4. Apply the `karpenter` namespace — it hosts the leader-election Lease (the Rafay drift webhook
+   rejects Lease writes in `rafay-system`) **and** the headroom pause-pod Deployments plus their
+   `headroom-policy` ConfigMap, so it must not be quota'd to zero pods or labelled with a Pod
+   Security profile the pause pods cannot satisfy
+5. Apply ServiceAccount + ClusterRole/Binding + the `karpenter-provider-rafay-leader-election`
+   Role/RoleBinding in the `karpenter` namespace
 6. Apply the Deployment into `rafay-system` and wait for the rollout
 
 ### `autoscaling-disable`
@@ -138,8 +141,37 @@ the Deployment back and the existing scaling configuration keeps working. `--ign
 keeps the state idempotent.
 
 > Nodes that Karpenter already provisioned are **not** removed on disable. Deleting the Deployment
-> stops further scale-out and scale-in; the existing fleet stays as-is until someone removes the
-> NodePools.
+> stops further scale-out and scale-in; the fleet stays as-is until someone removes the
+> NodePools — **with one exception: terminations already in flight.**
+
+**In-flight terminations at disable time.** The controller is what drives a NodeClaim through
+termination, and the broker does not check whether the client is still alive. So a NodeClaim
+that was `Terminating` when the Deployment was deleted is left pinned: its Node has been drained
+and tainted `karpenter.sh/disrupted:NoSchedule`, both objects still carry the
+`karpenter.sh/termination` finalizer, and nothing removes it while autoscaling is off — the
+capacity is lost for the whole disabled period. If the `<uid>-remove` had already been ACKed,
+the broker still processes it and the platform retires a machine regardless, so the fleet *does*
+change. On re-enable the provider's in-memory succeeded set is empty and `Delete()` re-sends
+`<uid>-remove`; the broker skips it only while its 24-hour SUCCEEDED tombstone lives, so after
+a longer outage the re-send is accepted as a new operation and the pool is decremented a
+**second** time. Before disabling, drain the disruption queue: wait until no NodeClaim carries a
+`deletionTimestamp` (`kubectl get nodeclaims` shows none `Terminating`), or be prepared to
+remove the `karpenter.sh/termination` finalizer from the Terminating Nodes/NodeClaims by hand
+and to reconcile the pool count in the catalog.
+
+**What happens to running nodes on the per-pool toggle and on catalog edits.** Disabling is
+also possible per pool without touching the Deployment: a catalog row whose `autoScaling` is
+turned off is rendered **inert** on the next config sync (`spec.limits.nodes: "0"`, an
+all-reasons `nodes: "0"` disruption budget, `karpenter.rafay.io/auto-scaling: "false"`), so the
+pool can neither scale out nor have its nodes consolidated; its running nodes keep their
+NodeClaims and are left alone, and the headroom controller holds its buffer at 0. When no row
+opts in at all the broker still ships every pool in the inert shape and the provider applies it,
+so a previously live NodePool is neutralised rather than left scaling. Because every rendered
+pool carries `spec.template.spec.expireAfter: Never`, no node is ever force-rotated on age, and
+because live pools carry a Drifted-scoped `nodes: "0"` budget, an edit to a row's labels,
+annotations, taints or SKU marks the pool's NodeClaims `Drifted` but never rolls them: such
+edits reach existing machines only through the platform or an explicit operator delete of the
+NodeClaim.
 
 ---
 
@@ -157,21 +189,31 @@ keeps the state idempotent.
 | `rbac.yaml` | `config/deploy/rbac.yaml` |
 | `deployment.yaml` | `config/deploy/deployment.yaml`, jinja-templated |
 
-**Changing a CRD or the RBAC in this repo means re-copying it into `infra-states`.** There is no
-build step that does it for you.
+**Changing a CRD, the RBAC, the namespace or the Deployment in this repo means re-copying it
+into `infra-states`.** There is no build step that does it for you. Recent changes that must be
+mirrored: the RafayNodeClass CRD's `categories: [karpenter]` and `required: [name, cpu, memory]`
+on instance-type entries; the ClusterRole trimmed to what the code performs (no Secrets or
+ServiceAccounts, lease reads only) plus the new `karpenter-provider-rafay-leader-election`
+Role/RoleBinding in the `karpenter` namespace; the Deployment's restricted security context,
+`/healthz` / `/readyz` probes on port 8081, `MEMORY_LIMIT` and explicit `HEADROOM_NAMESPACE`.
 
 `deployment.yaml` is the one that diverges: it resolves the image registry from `deployment_env`
 (the same jinja block every other Rafay state uses) and fills `EDGE_ID` / `RAFAY_CLUSTER_ID` /
-`RAFAY_PROJECT_ID` from the salt pillar. The image tag comes from the `KARPENTER_PROVIDER_VERSION`
-setting on edgesrv, defaulting to `latest`.
+`RAFAY_PROJECT_ID` from the salt pillar. The image is
+`{{ registry_url }}/rafay/karpenter-provider-rafay:{{ karpenter_version }}`, where the tag comes from
+the `KARPENTER_PROVIDER_VERSION` setting on edgesrv (pillar `karpenter_provider_version`), defaulting
+to `latest`. Jenkins publishes `<branch>-<build>` tags (e.g. `main-12`) and nothing publishes `latest`
+automatically, so set the version for any environment beyond ad-hoc dev.
 
-Two further pillars control the broker-driven node pool bootstrap (see
-[architecture.md §7.1](architecture.md#71-catalog--rafaynodeclass-bootstrap)):
+Three further pillars control the broker-driven node pool bootstrap (see
+[architecture.md §7.1](architecture.md#71-catalog--rafaynodeclass-bootstrap)) and the adoption of
+pre-existing worker nodes ([architecture.md §6.6](architecture.md#pkgcontrollersnodeadoption--existing-node-adoption-controller)):
 
 | Pillar | Default | Env var |
 | --- | --- | --- |
 | `karpenter_config_bootstrap` | `true` | `KARPENTER_CONFIG_BOOTSTRAP` |
 | `karpenter_config_sync_interval` | `10m` | `KARPENTER_CONFIG_SYNC_INTERVAL` |
+| `karpenter_adopt_existing_nodes` | `true` | `KARPENTER_ADOPT_EXISTING_NODES` |
 
 **This state installs no `NodePool` or `RafayNodeClass` of its own** — it applies only the CRDs,
 namespace, ServiceAccount, RBAC and Deployment. Before the bootstrap existed, enabling autoscaling

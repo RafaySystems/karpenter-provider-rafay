@@ -267,9 +267,11 @@ func TestSyncUsesForcedServerSideApply(t *testing.T) {
 	}
 }
 
-// A resync that returns the same revision must not re-apply: that is the whole point of the
-// broker sending one.
-func TestSyncSkipsUnchangedRevision(t *testing.T) {
+// A resync that returns the same revision still re-applies every object: the revision only
+// fingerprints the broker's YAML, not the cluster, so it cannot tell that a managed object was
+// deleted or hand-edited in between (R1-prov-misc-startup-2). The apply is idempotent, so the
+// only thing an unchanged revision changes is the log level.
+func TestSyncReappliesUnchangedRevision(t *testing.T) {
 	fetcher := &stubFetcher{resp: fullConfig()}
 	c, rec := newRecordingController(t, fetcher)
 
@@ -279,11 +281,19 @@ func TestSyncSkipsUnchangedRevision(t *testing.T) {
 	if err := c.sync(context.Background()); err != nil {
 		t.Fatalf("second sync: %v", err)
 	}
-	if len(rec.patches) != 2 {
-		t.Errorf("unchanged revision should not re-apply: %v", rec.kinds())
+	if len(rec.patches) != 4 {
+		t.Errorf("an unchanged revision must still re-apply every object: %v", rec.kinds())
 	}
 	if fetcher.calls != 2 {
-		t.Errorf("both syncs should still fetch: calls=%d", fetcher.calls)
+		t.Errorf("both syncs should fetch: calls=%d", fetcher.calls)
+	}
+	if c.lastRevision != "rev1" {
+		t.Errorf("lastRevision: want rev1, got %q", c.lastRevision)
+	}
+	for _, p := range rec.patches {
+		if got := p.obj.GetAnnotations()[revisionAnnotation]; got != "rev1" {
+			t.Errorf("%s: revision annotation on re-apply: want rev1, got %q", p.obj.GetKind(), got)
+		}
 	}
 }
 
@@ -355,8 +365,11 @@ func TestSyncTreatsConfigUnavailableAsNoOp(t *testing.T) {
 	}
 }
 
-// Applying NodePools to a cluster whose owner turned autoscaling off would start scaling it.
-func TestSyncSkipsWhenAutoScalingDisabled(t *testing.T) {
+// A cluster whose owner turned autoscaling off still gets its manifests applied: the broker
+// renders them inert (limits.nodes 0, zero budget, auto-scaling="false"), and applying that is
+// what neutralises a NodePool that was live a moment ago. Skipping the apply would leave the
+// last live NodePool in force until the toggle came back on.
+func TestSyncAppliesInertConfigWhenAutoScalingDisabled(t *testing.T) {
 	resp := fullConfig()
 	resp.AutoScaling = false
 	c, cl := newTestController(t, &stubFetcher{resp: resp})
@@ -370,11 +383,20 @@ func TestSyncSkipsWhenAutoScalingDisabled(t *testing.T) {
 	if err := cl.List(context.Background(), &pools); err != nil {
 		t.Fatalf("list node pools: %v", err)
 	}
-	if len(pools.Items) != 0 {
-		t.Errorf("autoscaling disabled: want no NodePools applied, got %d", len(pools.Items))
+	if len(pools.Items) != 1 {
+		t.Fatalf("autoscaling disabled: the inert NodePool must still be applied, got %d NodePools", len(pools.Items))
 	}
-	if c.lastRevision != "" {
-		t.Errorf("a skipped sync must not record a revision, got %q", c.lastRevision)
+	var classes unstructured.UnstructuredList
+	classes.SetAPIVersion("karpenter.rafay.io/v1alpha1")
+	classes.SetKind("RafayNodeClassList")
+	if err := cl.List(context.Background(), &classes); err != nil {
+		t.Fatalf("list node classes: %v", err)
+	}
+	if len(classes.Items) != 1 {
+		t.Fatalf("autoscaling disabled: the RafayNodeClass must still be applied, got %d", len(classes.Items))
+	}
+	if c.lastRevision != resp.Revision {
+		t.Errorf("an inert apply must record the revision like any other sync: got %q, want %q", c.lastRevision, resp.Revision)
 	}
 }
 

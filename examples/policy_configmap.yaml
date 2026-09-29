@@ -16,13 +16,15 @@ data:
     # The ReplicaSet replaces evicted pods; the Pending replacements make Karpenter
     # provision new nodes, restoring the buffer.
     pools:
-      - name: worker-pool-amd    # must match NodePool .metadata.name exactly
-        cpu: 30%                 # keep 30% of the pool's total CPU pre-reserved
+      - name: worker-pool-amd    # must match NodePool .metadata.name exactly (DNS-1123 label)
+        cpu: 30%                 # keep 30% of the pool's total CPU pre-reserved (max 50%)
         memory: 20%              # keep 20% of the pool's total memory pre-reserved
         podCPU: 500m             # per-pod CPU slice (default 500m if omitted)
         podMemory: 512Mi         # per-pod memory slice (default 512Mi if omitted)
         minPods: 2               # cold-start floor: keep 2 pods even with zero ready nodes,
                                  # so Karpenter provisions the first nodes of an empty pool
+                                 # (the NodePool must exist and be live — an inert pool gets none)
+        maxPods: 40              # optional: absolute ceiling on pause pods (must be >= minPods)
       - name: worker-pool-gpu
         cpu: 10%
         memory: 10%

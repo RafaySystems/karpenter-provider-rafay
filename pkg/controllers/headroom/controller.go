@@ -33,34 +33,58 @@ limitations under the License.
 // ConfigMap format (data key "policy"):
 //
 //	pools:
-//	  - name: worker-pool-amd   # must match a Karpenter NodePool .metadata.name
-//	    cpu: 30%                # buffer fractions of total pool allocatable
+//	  - name: worker-pool-amd   # must match a Karpenter NodePool .metadata.name (DNS label)
+//	    cpu: 30%                # buffer fractions of total pool allocatable, at most 50%
 //	    memory: 20%
 //	    gpu: 10%                # existing GPU nodes only — see the GPU note below
 //	    podCPU: 500m            # absolute per-pod slice (defaults: 500m / 512Mi)
 //	    podMemory: 512Mi
-//	    podGPU: "1"             # no default; a GPU buffer requires this
+//	    podGPU: "1"             # no default; a GPU buffer requires this; whole devices only
 //	    minPods: 2              # replica floor even with zero ready nodes (cold start)
+//	    maxPods: 40             # optional replica ceiling (bounds the buffer absolutely)
 //	    tolerations:            # optional; NO blanket Exists toleration is added
 //	      - key: example.com/dedicated
 //	        operator: Equal
 //	        value: headroom
 //	        effect: NoSchedule
 //
-// GPU headroom, and its limitation: a GPU buffer reserves capacity on the pool's EXISTING
-// GPU nodes; it CANNOT drive scale-out. The Rafay cloudprovider's instance types advertise
-// only cpu/memory/pods in their Capacity (never nvidia.com/gpu or amd.com/gpu), so Karpenter
-// cannot satisfy a pending pod that requests a GPU extended resource and will not provision a
-// node for it. Consequently the GPU resource name is derived from the GPU nodes the pool
-// already has, and on a pool without GPU nodes the podGPU request is dropped instead of
-// guessed (a guessed request would only park a pause pod in Pending forever). Use minPods with
-// a cpu/memory-sized pod to cold-start a GPU pool; the GPU buffer applies once nodes exist.
+// Sizing and scale-in. The buffer is a fraction f of the pool's TOTAL allocatable, which
+// includes the nodes the buffer itself caused to be provisioned, so relative to the real
+// workload the effective buffer is f/(1-f-d) with d the per-node DaemonSet/system share —
+// f is capped at 50% so a fixed point always exists (see maxBufferPercent), and `maxPods`
+// bounds the buffer absolutely for pools where even that is too much. Every NodePool on this
+// platform consolidates WhenEmpty (edge-broker renders nothing else), whose only scale-in
+// trigger is a node with no pods, so the pause pods are PACKED onto as few nodes as possible
+// (a preferred podAffinity on kubernetes.io/hostname; deliberately no hostname topology
+// spread, which would keep one pause pod on every node and make scale-in impossible). Even
+// so, a pool with headroom never shrinks below ceil((workload + buffer) / node size) nodes,
+// and a node that ends up hosting a pause pod is only reclaimed once that pod leaves it.
+//
+// Inert pools. edge-broker renders a catalog row that did not opt into autoscaling as a
+// NodePool annotated karpenter.rafay.io/auto-scaling="false" with limits.nodes 0, and
+// nodeadoption never adopts its nodes, so no node ever carries karpenter.sh/nodepool=<name>
+// and the NodePool cannot launch. A headroom Deployment for such a pool (or for a pool whose
+// NodePool does not exist) could only ever produce Pending pause pods, so reconcilePool keeps
+// its Deployment at 0 replicas — scaling an existing one down after a live→inert flip and
+// never creating one — and reports the reason once per transition.
+//
+// GPU headroom is reserve-only BY DESIGN: a GPU buffer reserves capacity on the pool's
+// EXISTING GPU nodes and does not drive scale-out. The cloudprovider's instance types do
+// advertise a temporary hardcoded nvidia.com/gpu capacity (v1alpha1.InstanceTypeSpec.GPU),
+// so Karpenter could provision for a pending GPU pod; the controller nevertheless derives the
+// GPU resource name from the GPU nodes the pool already has, and on a pool without GPU nodes
+// the podGPU request is dropped instead of guessed — the temporary field carries no per-SKU
+// truth, and on an amd.com/gpu pool the guess would be wrong outright. Use minPods with a
+// cpu/memory-sized pod to cold-start a GPU pool; the GPU buffer applies once nodes exist.
+// Sourcing the key from the instance type is the follow-up once real per-SKU accelerator
+// capacity replaces the temporary field (see config.go).
 //
 // Required RBAC (no kubebuilder markers in this repo — keep the ClusterRole in sync):
 //   - apps/deployments: create, update, delete, get, list, watch
 //   - pods: delete, get, list, watch (legacy bare-pod GC)
-//   - configmaps: get, list, watch
+//   - configmaps: get, list, watch (the policy ConfigMap's namespace only)
 //   - nodes: get, list, watch
+//   - karpenter.sh/nodepools: get, list, watch (inert-pool detection)
 //   - scheduling.k8s.io/priorityclasses: create, get
 package headroom
 
@@ -69,6 +93,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/samber/lo"
@@ -77,10 +102,12 @@ import (
 	schedulingv1 "k8s.io/api/scheduling/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	crcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -88,6 +115,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
+	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 )
 
 const (
@@ -99,11 +128,23 @@ const (
 	// NodePool, so Karpenter's provisioner knows which NodePool to scale out.
 	karpenterNodePoolLabel = "karpenter.sh/nodepool"
 
+	// autoScalingAnnotationKey is stamped by edge-broker on every NodePool it renders; "false"
+	// marks a pool rendered for visibility only (its catalog row did not opt into autoscaling).
+	// nodeadoption keys off the same string and never adopts such a pool's nodes.
+	autoScalingAnnotationKey = "karpenter.rafay.io/auto-scaling"
+	// nodesLimitKey is the NodePool limits entry the broker sets to 0 on an inert pool.
+	nodesLimitKey = corev1.ResourceName("nodes")
+
 	pauseImage        = "registry.k8s.io/pause:3.9"
 	priorityClassName = "rafay-headroom"
 	// priorityValue is intentionally negative so any normal pod (priority 0) can preempt
 	// headroom pods, freeing capacity for real workloads without extra configuration.
 	priorityValue = int32(-1000)
+
+	// pauseRunAsUser is the non-root UID the pause container runs as. The pause image ships
+	// no USER, and the restricted Pod Security Standard rejects a pod that cannot prove it
+	// runs as non-root; 65535 ("nobody") is the conventional choice.
+	pauseRunAsUser = int64(65535)
 
 	configMapName = "headroom-policy"
 
@@ -131,9 +172,20 @@ var gpuResourceNames = []corev1.ResourceName{"nvidia.com/gpu", "amd.com/gpu"}
 // MaxConcurrentReconciles is 1 and every reconcile is a full sync of all pools (singleton
 // semantics) — ConfigMap, Node and Deployment events all funnel into one synthetic request.
 type Controller struct {
-	kubeClient      client.Client
+	kubeClient client.Client
+	// configReader reads the policy ConfigMap. In production it is the manager's uncached
+	// APIReader: one small GET per sync, instead of the cluster-wide ConfigMap informer the
+	// cached client would start on first use (every ConfigMap in every namespace held in
+	// memory for the sake of one). Nil means kubeClient (tests).
+	configReader    client.Reader
 	podNamespace    string
 	configNamespace string
+
+	// inert remembers, per pool, the reason its headroom is held at 0 replicas, so the
+	// transition is logged once rather than on every sync (a NodePool missing or rendered
+	// inert is a steady state, resynced every resyncInterval).
+	inertMu sync.Mutex
+	inert   map[string]string
 }
 
 // NewController creates the headroom buffer maintainer.
@@ -150,9 +202,11 @@ func NewController(podNamespace, configNamespace string) *Controller {
 // manager and registers a controller-runtime controller that performs a full sync on:
 //   - changes to the headroom-policy ConfigMap (config changes apply immediately);
 //   - Karpenter pool node events (allocatable totals changed);
+//   - NodePool spec/annotation changes (a pool rendered inert, or live again);
 //   - headroom Deployment events (drift repair / self-heal).
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 	c.kubeClient = m.GetClient()
+	c.configReader = m.GetAPIReader()
 
 	// Create the PriorityClass at startup so it exists before the first Deployment's pods are
 	// admitted. This is only a head start: Reconcile re-ensures it on every sync, which is
@@ -166,7 +220,28 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 		return err
 	}
 
-	// Only the headroom-policy ConfigMap in the config namespace is interesting.
+	// The ConfigMap watch runs on its own cache scoped to the config namespace and the policy
+	// ConfigMap's name. A For()/Watches() on the manager's cache would start a CLUSTER-WIDE
+	// ConfigMap informer (the operator's cache options only scope Leases), caching every
+	// ConfigMap in every namespace in this process's memory for the sake of one object.
+	configCache, err := cache.New(m.GetConfig(), cache.Options{
+		HTTPClient:        m.GetHTTPClient(),
+		Scheme:            m.GetScheme(),
+		Mapper:            m.GetRESTMapper(),
+		DefaultNamespaces: map[string]cache.Config{c.configNamespace: {}},
+		ByObject: map[client.Object]cache.ByObject{
+			&corev1.ConfigMap{}: {Field: fields.OneTermEqualSelector("metadata.name", configMapName)},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("headroom: create policy ConfigMap cache: %w", err)
+	}
+	if err := m.Add(configCache); err != nil {
+		return fmt.Errorf("headroom: add policy ConfigMap cache: %w", err)
+	}
+
+	// Only the headroom-policy ConfigMap in the config namespace is interesting (the cache is
+	// already scoped that way; the predicate keeps the contract explicit).
 	configMapPredicate := predicate.NewPredicateFuncs(func(obj client.Object) bool {
 		return obj.GetName() == configMapName && obj.GetNamespace() == c.configNamespace
 	})
@@ -178,13 +253,23 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 	headroomDeploymentPredicate := predicate.NewPredicateFuncs(func(obj client.Object) bool {
 		return obj.GetNamespace() == c.podNamespace && obj.GetLabels()[headroomLabel] == "true"
 	})
+	// A NodePool matters when it appears/disappears or its spec (limits) or annotations
+	// (auto-scaling) change; status updates (node counts) already reach us via Node events.
+	nodePoolPredicate := predicate.Or(predicate.GenerationChangedPredicate{}, predicate.AnnotationChangedPredicate{})
 
 	return controllerruntime.NewControllerManagedBy(m).
 		Named("headroom").
-		For(&corev1.ConfigMap{}, builder.WithPredicates(configMapPredicate)).
+		WatchesRawSource(source.Kind[client.Object](configCache, &corev1.ConfigMap{},
+			handler.EnqueueRequestsFromMapFunc(mapToSyncRequest),
+			configMapPredicate,
+		)).
 		Watches(&corev1.Node{},
 			handler.EnqueueRequestsFromMapFunc(mapToSyncRequest),
 			builder.WithPredicates(poolNodePredicate),
+		).
+		Watches(&karpv1.NodePool{},
+			handler.EnqueueRequestsFromMapFunc(mapToSyncRequest),
+			builder.WithPredicates(nodePoolPredicate),
 		).
 		Watches(&appsv1.Deployment{},
 			handler.EnqueueRequestsFromMapFunc(mapToSyncRequest),
@@ -228,6 +313,7 @@ func (c *Controller) Reconcile(ctx context.Context, _ reconcile.Request) (reconc
 			errs = append(errs, fmt.Errorf("pool %q: %w", pool.Name, err))
 		}
 	}
+	c.forgetInertExcept(pools)
 	if err := c.cleanupLegacyPods(ctx); err != nil {
 		klog.Warningf("headroom: cleanup legacy pods: %v", err)
 		errs = append(errs, err)
@@ -243,9 +329,13 @@ func (c *Controller) Reconcile(ctx context.Context, _ reconcile.Request) (reconc
 }
 
 func (c *Controller) loadPools(ctx context.Context) ([]parsedPoolPolicy, error) {
+	reader := c.configReader
+	if reader == nil {
+		reader = c.kubeClient
+	}
 	var cm corev1.ConfigMap
 	key := types.NamespacedName{Name: configMapName, Namespace: c.configNamespace}
-	if err := c.kubeClient.Get(ctx, key, &cm); err != nil {
+	if err := reader.Get(ctx, key, &cm); err != nil {
 		if kerrors.IsNotFound(err) {
 			return nil, nil
 		}
@@ -257,24 +347,54 @@ func (c *Controller) loadPools(ctx context.Context) ([]parsedPoolPolicy, error) 
 // reconcilePool applies the headroom Deployment for one pool.
 //
 // Buffer model: replicas = max over configured resources of
-// ceil(fraction × Σ ready-node allocatable / per-pod size), floored at minPods.
-// Pod requests are exactly the per-pod size (NOT derived from node size) — the buffer is
-// denominated absolutely, so preempting one pod frees a predictable slice of capacity.
+// ceil(fraction × Σ ready-node allocatable / per-pod size), floored at minPods and capped at
+// maxPods. Pod requests are exactly the per-pod size (NOT derived from node size) — the
+// buffer is denominated absolutely, so preempting one pod frees a predictable slice of capacity.
+//
+// An inert pool (NodePool missing, annotated auto-scaling=false, or limits.nodes 0 — see the
+// package doc) gets no buffer: its pause pods could never schedule, and the fork's scheduler
+// would report "node limits have been exhausted" for each of them on every loop. An existing
+// Deployment is scaled to 0 (so a pool that comes back scales up in place); none is created.
 func (c *Controller) reconcilePool(ctx context.Context, pool parsedPoolPolicy) error {
-	var nodeList corev1.NodeList
-	if err := c.kubeClient.List(ctx, &nodeList, client.MatchingLabels{karpenterNodePoolLabel: pool.Name}); err != nil {
-		return fmt.Errorf("list nodes: %w", err)
+	inertReason, err := c.poolInertReason(ctx, pool.Name)
+	if err != nil {
+		return fmt.Errorf("get nodepool: %w", err)
 	}
-	readyNodes := filterReady(nodeList.Items)
+	c.noteInert(pool.Name, inertReason)
 
-	total := sumAllocatable(readyNodes)
-	replicas := desiredReplicas(pool, total, len(readyNodes))
-	requests := perPodRequests(pool, total.gpuKey)
-	if !pool.PodGPU.IsZero() && total.gpuKey == "" {
-		klog.Warningf("headroom: pool %q configures podGPU but none of its %d ready nodes advertise a GPU resource; "+
-			"omitting the GPU request (GPU headroom cannot provision GPU nodes, only reserve capacity on existing ones)",
-			pool.Name, len(readyNodes))
+	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
+		Name:      deploymentName(pool.Name),
+		Namespace: c.podNamespace,
+	}}
+
+	var (
+		readyNodes []corev1.Node
+		total      poolAllocatable
+		replicas   int32
+	)
+	if inertReason == "" {
+		var nodeList corev1.NodeList
+		if err := c.kubeClient.List(ctx, &nodeList, client.MatchingLabels{karpenterNodePoolLabel: pool.Name}); err != nil {
+			return fmt.Errorf("list nodes: %w", err)
+		}
+		readyNodes = filterReady(nodeList.Items)
+		total = sumAllocatable(readyNodes)
+		replicas = desiredReplicas(pool, total, len(readyNodes))
+		if !pool.PodGPU.IsZero() && total.gpuKey == "" {
+			klog.Warningf("headroom: pool %q configures podGPU but none of its %d ready nodes advertise a GPU resource; "+
+				"omitting the GPU request (GPU headroom is reserve-only by design: it sizes from existing GPU nodes and does not cold-start them)",
+				pool.Name, len(readyNodes))
+		}
+	} else {
+		// Never create a Deployment for an inert pool; only hold an existing one at 0.
+		if err := c.kubeClient.Get(ctx, client.ObjectKeyFromObject(dep), &appsv1.Deployment{}); err != nil {
+			if kerrors.IsNotFound(err) {
+				return nil
+			}
+			return fmt.Errorf("get deployment %s/%s: %w", c.podNamespace, dep.Name, err)
+		}
 	}
+	requests := perPodRequests(pool, total.gpuKey)
 
 	podLabels := map[string]string{
 		headroomLabel:     "true",
@@ -283,10 +403,6 @@ func (c *Controller) reconcilePool(ctx context.Context, pool parsedPoolPolicy) e
 	grace := int64(0)
 	never := corev1.PreemptNever
 
-	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
-		Name:      deploymentName(pool.Name),
-		Namespace: c.podNamespace,
-	}}
 	op, err := controllerutil.CreateOrUpdate(ctx, c.kubeClient, dep, func() error {
 		dep.Labels = podLabels
 		// Selector is immutable after creation; only set it on create.
@@ -297,7 +413,7 @@ func (c *Controller) reconcilePool(ctx context.Context, pool parsedPoolPolicy) e
 
 		// Mutate only the fields this controller owns, in place on the FETCHED template.
 		// Assigning a whole PodTemplateSpec here would drop everything the API server
-		// defaults (restartPolicy, dnsPolicy, schedulerName, securityContext, per-container
+		// defaults (restartPolicy, dnsPolicy, schedulerName, per-container
 		// terminationMessagePath, …), so the mutated object would differ from the stored one
 		// on EVERY reconcile — CreateOrUpdate would issue a pointless Update and log
 		// "updated" every 5 minutes, forever.
@@ -312,14 +428,32 @@ func (c *Controller) reconcilePool(ctx context.Context, pool parsedPoolPolicy) e
 		// Only tolerations from the pool config — deliberately NO blanket Exists
 		// toleration, so headroom pods respect taints that real workloads cannot cross.
 		tmpl.Spec.Tolerations = pool.Tolerations
-		// Spread placeholder pods across nodes so preempting one frees capacity on
-		// the node where the real workload wants to land.
-		tmpl.Spec.TopologySpreadConstraints = []corev1.TopologySpreadConstraint{{
-			MaxSkew:           1,
-			TopologyKey:       corev1.LabelHostname,
-			WhenUnsatisfiable: corev1.ScheduleAnyway,
-			LabelSelector:     &metav1.LabelSelector{MatchLabels: map[string]string{headroomPoolLabel: pool.Name}},
+		// PACK placeholder pods: prefer nodes that already host this pool's pause pods, and
+		// carry no topology spread. Every NodePool here consolidates WhenEmpty, whose only
+		// scale-in trigger is a node with zero pods; a hostname spread would keep one pause
+		// pod on every node of the pool and make scale-in impossible (each burst would ratchet
+		// the pool up for good). Preempting a packed pod still frees exactly one per-pod
+		// slice on the node where the real workload landed. The nil assignment also strips
+		// the spread from Deployments created by earlier versions.
+		tmpl.Spec.TopologySpreadConstraints = nil
+		tmpl.Spec.Affinity = &corev1.Affinity{PodAffinity: &corev1.PodAffinity{
+			PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{{
+				Weight: 100,
+				PodAffinityTerm: corev1.PodAffinityTerm{
+					TopologyKey:   corev1.LabelHostname,
+					LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{headroomPoolLabel: pool.Name}},
+				},
+			}},
 		}}
+		// A pause pod needs no API access and must be admitted under the restricted Pod
+		// Security Standard (otherwise the ReplicaSet's pod creates are rejected while the
+		// Deployment itself is accepted, and the buffer silently never materialises).
+		tmpl.Spec.AutomountServiceAccountToken = lo.ToPtr(false)
+		tmpl.Spec.SecurityContext = &corev1.PodSecurityContext{
+			RunAsNonRoot:   lo.ToPtr(true),
+			RunAsUser:      lo.ToPtr(pauseRunAsUser),
+			SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+		}
 		if len(tmpl.Spec.Containers) != 1 {
 			tmpl.Spec.Containers = make([]corev1.Container, 1)
 		}
@@ -327,6 +461,10 @@ func (c *Controller) reconcilePool(ctx context.Context, pool parsedPoolPolicy) e
 		ctr.Name = "pause"
 		ctr.Image = pauseImage
 		ctr.ImagePullPolicy = corev1.PullIfNotPresent
+		ctr.SecurityContext = &corev1.SecurityContext{
+			AllowPrivilegeEscalation: lo.ToPtr(false),
+			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+		}
 		// Requests == Limits → Guaranteed QoS; each pod holds exactly its slice.
 		ctr.Resources = corev1.ResourceRequirements{
 			Requests: requests,
@@ -338,10 +476,68 @@ func (c *Controller) reconcilePool(ctx context.Context, pool parsedPoolPolicy) e
 		return fmt.Errorf("apply deployment %s/%s: %w", c.podNamespace, dep.Name, err)
 	}
 	if op != controllerutil.OperationResultNone {
-		klog.Infof("headroom: %s deployment %s/%s pool=%s replicas=%d perPod=%v readyNodes=%d",
-			op, dep.Namespace, dep.Name, pool.Name, replicas, requests, len(readyNodes))
+		klog.Infof("headroom: %s deployment %s/%s pool=%s replicas=%d perPod=%v readyNodes=%d inert=%q",
+			op, dep.Namespace, dep.Name, pool.Name, replicas, requests, len(readyNodes), inertReason)
 	}
 	return nil
+}
+
+// poolInertReason reports why pool cannot host headroom pods, or "" when it can. edge-broker
+// renders a catalog row that did not opt into autoscaling as a NodePool annotated
+// auto-scaling="false" with limits.nodes 0; nodeadoption never labels its nodes and the
+// NodePool cannot launch, so pause pods selecting it would pend forever. A NodePool that does
+// not exist (not rendered yet, or removed from the catalog) is inert for the same reason —
+// the NodePool watch resyncs the moment it appears.
+func (c *Controller) poolInertReason(ctx context.Context, name string) (string, error) {
+	var np karpv1.NodePool
+	if err := c.kubeClient.Get(ctx, types.NamespacedName{Name: name}, &np); err != nil {
+		if kerrors.IsNotFound(err) {
+			return "NodePool does not exist", nil
+		}
+		return "", err
+	}
+	if np.Annotations[autoScalingAnnotationKey] == "false" {
+		return autoScalingAnnotationKey + "=false", nil
+	}
+	if q, ok := np.Spec.Limits[nodesLimitKey]; ok && q.IsZero() {
+		return "limits.nodes is 0", nil
+	}
+	return "", nil
+}
+
+// noteInert logs a pool's inert/live transitions exactly once each.
+func (c *Controller) noteInert(pool, reason string) {
+	c.inertMu.Lock()
+	defer c.inertMu.Unlock()
+	prev, wasInert := c.inert[pool]
+	switch {
+	case reason == "" && wasInert:
+		delete(c.inert, pool)
+		klog.Infof("headroom: pool %q is live again; restoring its buffer", pool)
+	case reason != "" && prev != reason:
+		if c.inert == nil {
+			c.inert = map[string]string{}
+		}
+		c.inert[pool] = reason
+		klog.Warningf("headroom: pool %q is inert (%s); holding its headroom at 0 replicas — pause pods could never schedule there",
+			pool, reason)
+	}
+}
+
+// forgetInertExcept drops the inert memory of pools no longer in the policy, so a pool that is
+// removed and later re-added is reported afresh.
+func (c *Controller) forgetInertExcept(pools []parsedPoolPolicy) {
+	c.inertMu.Lock()
+	defer c.inertMu.Unlock()
+	configured := make(map[string]bool, len(pools))
+	for _, pool := range pools {
+		configured[pool.Name] = true
+	}
+	for name := range c.inert {
+		if !configured[name] {
+			delete(c.inert, name)
+		}
+	}
 }
 
 // deploymentName returns the per-pool headroom Deployment name.
@@ -355,11 +551,12 @@ type poolAllocatable struct {
 	memBytes int64
 	gpu      int64
 	// gpuKey is the GPU extended resource name observed on the pool's ready nodes, and is
-	// EMPTY when none of them advertise a GPU. It is deliberately not defaulted: guessing
-	// nvidia.com/gpu for a pool with no GPU nodes yet would stamp a GPU request that nothing
-	// can satisfy (the cloudprovider's instance types never advertise GPU capacity, so
-	// Karpenter cannot provision for it) and park the pause pod in Pending forever — and on
-	// an amd.com/gpu pool the guess would be wrong outright.
+	// EMPTY when none of them advertise a GPU. It is deliberately not defaulted: GPU headroom
+	// is reserve-only by design (see the package doc). The cloudprovider's instance types do
+	// advertise a temporary hardcoded nvidia.com/gpu capacity, but it carries no per-SKU
+	// truth, so guessing nvidia.com/gpu for a pool with no GPU nodes yet would request a
+	// resource the real machine may not have (and on an amd.com/gpu pool the guess would be
+	// wrong outright) — parking the pause pod in Pending forever.
 	gpuKey corev1.ResourceName
 }
 
@@ -380,8 +577,13 @@ func sumAllocatable(nodes []corev1.Node) poolAllocatable {
 }
 
 // desiredReplicas computes the replica count for one pool's headroom Deployment: the max
-// over configured resources of ceil(buffer / perPod), floored at minPods. With no ready
-// nodes the buffer is zero, so the result is exactly minPods (cold start; 0 if unset).
+// over configured resources of ceil(buffer / perPod), floored at minPods and, when set,
+// capped at maxPods. With no ready nodes the buffer is zero, so the result is exactly
+// minPods (cold start; 0 if unset).
+//
+// The buffer is sized from the pool's TOTAL allocatable, including the nodes the buffer
+// itself caused to be provisioned, so it grows with the pool (effective f/(1-f-d) of the
+// real workload, see the package doc); maxPods is the operator's absolute bound on that.
 //
 // The result is clamped into [0, maxHeadroomReplicas] before the int32 cast: parse-time
 // validation makes an absurd count unlikely, but an unclamped int64→int32 cast would turn
@@ -402,6 +604,10 @@ func desiredReplicas(pool parsedPoolPolicy, total poolAllocatable, readyNodes in
 		}
 	}
 	n = max(n, int64(pool.MinPods))
+	// Parse-time validation guarantees maxPods >= minPods when both are set.
+	if pool.MaxPods > 0 {
+		n = min(n, int64(pool.MaxPods))
+	}
 	if n < 0 {
 		klog.Warningf("headroom: pool %q computed a negative replica count (%d); clamping to 0 — check podCPU/podMemory/minPods", pool.Name, n)
 		n = 0
@@ -432,7 +638,7 @@ func ceilDiv(buffer float64, perPod int64) int64 {
 // (defaulted) per-pod size. GPU is added only when podGPU is configured AND the pool's ready
 // nodes actually advertise a GPU extended resource, whose name gpuKey carries: with no GPU
 // node there is no key to request, and requesting a guessed one would only strand the pause
-// pod in Pending (Karpenter cannot provision GPU capacity for it — see the package doc).
+// pod in Pending (GPU headroom is reserve-only by design — see the package doc).
 func perPodRequests(pool parsedPoolPolicy, gpuKey corev1.ResourceName) corev1.ResourceList {
 	reqs := corev1.ResourceList{
 		corev1.ResourceCPU:    pool.PodCPU,
@@ -498,12 +704,25 @@ func (c *Controller) cleanupStaleDeployments(ctx context.Context, pools []parsed
 // priority=-1000 means every normal pod (priority≥0) can preempt headroom pods.
 // PreemptionPolicy=Never prevents headroom pods from evicting other pods.
 //
+// It reads first (a cached Get) and only Creates on NotFound: it runs on every reconcile,
+// and reconciles fire on every pool-node update and every pause-pod churn event, so a
+// Create-first strategy would send one write-path POST (an audit-logged 409) per event.
+//
 // A PriorityClass's Value is immutable and we hold no update verb, so a pre-existing class
 // with different settings cannot be repaired here — but it must not pass silently either: a
 // non-negative Value makes headroom pods un-preemptable (headroom stops handing capacity
 // back to real workloads) and PreemptionPolicy!=Never lets them evict real ones. Both are
 // reported loudly on every reconcile; fixing them means deleting the PriorityClass.
 func (c *Controller) ensurePriorityClass(ctx context.Context) error {
+	var existing schedulingv1.PriorityClass
+	err := c.kubeClient.Get(ctx, types.NamespacedName{Name: priorityClassName}, &existing)
+	if err == nil {
+		return checkPriorityClassDrift(&existing)
+	}
+	if !kerrors.IsNotFound(err) {
+		return fmt.Errorf("get existing PriorityClass %q: %w", priorityClassName, err)
+	}
+
 	never := corev1.PreemptNever
 	pv := priorityValue
 	pc := &schedulingv1.PriorityClass{
@@ -515,6 +734,7 @@ func (c *Controller) ensurePriorityClass(ctx context.Context) error {
 	}
 	if err := c.kubeClient.Create(ctx, pc); err != nil {
 		if kerrors.IsAlreadyExists(err) {
+			// Lost a race with another creator (or the cache lagged); check what won.
 			return c.checkPriorityClassDrift(ctx)
 		}
 		return err
@@ -523,13 +743,19 @@ func (c *Controller) ensurePriorityClass(ctx context.Context) error {
 	return nil
 }
 
-// checkPriorityClassDrift warns when the existing rafay-headroom PriorityClass does not carry
-// the settings headroom preemption depends on. It never mutates the class (no update verb).
+// checkPriorityClassDrift fetches the existing rafay-headroom PriorityClass and warns when it
+// does not carry the settings headroom preemption depends on. It never mutates the class.
 func (c *Controller) checkPriorityClassDrift(ctx context.Context) error {
 	var existing schedulingv1.PriorityClass
 	if err := c.kubeClient.Get(ctx, types.NamespacedName{Name: priorityClassName}, &existing); err != nil {
 		return fmt.Errorf("get existing PriorityClass %q: %w", priorityClassName, err)
 	}
+	return checkPriorityClassDrift(&existing)
+}
+
+// checkPriorityClassDrift warns when the given rafay-headroom PriorityClass does not carry
+// the settings headroom preemption depends on (no update verb, so it is never repaired).
+func checkPriorityClassDrift(existing *schedulingv1.PriorityClass) error {
 	if existing.Value != priorityValue {
 		klog.Warningf("headroom: PriorityClass %q has value=%d, expected %d — headroom pods may not be preemptable by real workloads; "+
 			"delete the PriorityClass to have it recreated correctly", priorityClassName, existing.Value, priorityValue)

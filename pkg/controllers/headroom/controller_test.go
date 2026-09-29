@@ -27,13 +27,36 @@ import (
 	schedulingv1 "k8s.io/api/scheduling/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 )
 
 const testNamespace = "karpenter"
+
+// hrScheme is the client-go scheme plus Karpenter's NodePool, which reconcilePool reads to
+// tell an inert pool (or a missing NodePool) from a live one.
+func hrScheme() *runtime.Scheme {
+	s := runtime.NewScheme()
+	utilruntime.Must(clientgoscheme.AddToScheme(s))
+	gv := schema.GroupVersion{Group: "karpenter.sh", Version: "v1"}
+	s.AddKnownTypes(gv, &karpv1.NodePool{}, &karpv1.NodePoolList{})
+	metav1.AddToGroupVersion(s, gv)
+	return s
+}
+
+// livePool is a broker-shaped live NodePool (auto-scaling="true", limits.nodes 10). The
+// headroom of a pool whose NodePool is missing or inert is held at 0 replicas, so every test
+// that expects a buffer seeds one of these for its pool.
+func livePool(name string) *karpv1.NodePool {
+	return fupNodePool(name, true)
+}
 
 func makeNode(name, pool string, alloc corev1.ResourceList, ready bool) *corev1.Node {
 	status := corev1.ConditionFalse
@@ -61,7 +84,7 @@ func standardAlloc(cpu, memory string) corev1.ResourceList {
 
 func newTestController(objs ...client.Object) *Controller {
 	return &Controller{
-		kubeClient:      fake.NewClientBuilder().WithObjects(objs...).Build(),
+		kubeClient:      fake.NewClientBuilder().WithScheme(hrScheme()).WithObjects(objs...).Build(),
 		podNamespace:    testNamespace,
 		configNamespace: testNamespace,
 	}
@@ -286,6 +309,7 @@ func TestReconcilePool_DeploymentShape(t *testing.T) {
 	gpuAlloc := standardAlloc("4", "16Gi")
 	gpuAlloc["nvidia.com/gpu"] = resource.MustParse("2")
 	c := newTestController(
+		livePool("worker-a"),
 		makeNode("n1", "worker-a", gpuAlloc, true),
 		makeNode("other", "worker-b", standardAlloc("64", "256Gi"), true), // different pool: excluded
 	)
@@ -330,16 +354,24 @@ func TestReconcilePool_DeploymentShape(t *testing.T) {
 		t.Errorf("nodeSelector = %v, want %v", podSpec.NodeSelector, wantNodeSelector)
 	}
 
-	if len(podSpec.TopologySpreadConstraints) != 1 {
-		t.Fatalf("topologySpreadConstraints = %v, want exactly 1", podSpec.TopologySpreadConstraints)
+	// Pause pods PACK (preferred podAffinity on hostname) and carry no topology spread: every
+	// NodePool consolidates WhenEmpty, so a hostname spread would keep one pause pod on every
+	// node and make scale-in impossible.
+	if len(podSpec.TopologySpreadConstraints) != 0 {
+		t.Errorf("topologySpreadConstraints = %v, want none", podSpec.TopologySpreadConstraints)
 	}
-	tsc := podSpec.TopologySpreadConstraints[0]
-	if tsc.MaxSkew != 1 || tsc.TopologyKey != corev1.LabelHostname || tsc.WhenUnsatisfiable != corev1.ScheduleAnyway {
-		t.Errorf("topology spread = %+v, want maxSkew=1 key=%s whenUnsatisfiable=ScheduleAnyway", tsc, corev1.LabelHostname)
+	if podSpec.Affinity == nil || podSpec.Affinity.PodAffinity == nil ||
+		len(podSpec.Affinity.PodAffinity.PreferredDuringSchedulingIgnoredDuringExecution) != 1 ||
+		len(podSpec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution) != 0 {
+		t.Fatalf("affinity = %+v, want exactly one preferred (never required) podAffinity term", podSpec.Affinity)
 	}
-	wantTSCSelector := map[string]string{headroomPoolLabel: "worker-a"}
-	if tsc.LabelSelector == nil || !reflect.DeepEqual(tsc.LabelSelector.MatchLabels, wantTSCSelector) {
-		t.Errorf("topology spread selector = %v, want matchLabels %v", tsc.LabelSelector, wantTSCSelector)
+	term := podSpec.Affinity.PodAffinity.PreferredDuringSchedulingIgnoredDuringExecution[0]
+	if term.Weight != 100 || term.PodAffinityTerm.TopologyKey != corev1.LabelHostname {
+		t.Errorf("podAffinity term = %+v, want weight 100 on %s", term, corev1.LabelHostname)
+	}
+	wantAffinitySelector := map[string]string{headroomPoolLabel: "worker-a"}
+	if term.PodAffinityTerm.LabelSelector == nil || !reflect.DeepEqual(term.PodAffinityTerm.LabelSelector.MatchLabels, wantAffinitySelector) {
+		t.Errorf("podAffinity selector = %v, want matchLabels %v", term.PodAffinityTerm.LabelSelector, wantAffinitySelector)
 	}
 
 	// Tolerations must be exactly the configured ones — no blanket Exists toleration.
@@ -381,7 +413,7 @@ func TestReconcilePool_NoTolerationsNoGPU(t *testing.T) {
 		PodCPU:    resource.MustParse("500m"),
 		PodMemory: resource.MustParse("512Mi"),
 	}
-	c := newTestController(makeNode("n1", "worker-b", standardAlloc("2", "8Gi"), true))
+	c := newTestController(livePool("worker-b"), makeNode("n1", "worker-b", standardAlloc("2", "8Gi"), true))
 
 	if err := c.reconcilePool(context.Background(), pool); err != nil {
 		t.Fatalf("reconcilePool: %v", err)
@@ -413,7 +445,7 @@ func TestReconcilePool_ColdStartMinPods(t *testing.T) {
 		MinPods:   2,
 	}
 	// One node exists for the pool but is NotReady → still cold.
-	c := newTestController(makeNode("n1", "empty-pool", standardAlloc("4", "16Gi"), false))
+	c := newTestController(livePool("empty-pool"), makeNode("n1", "empty-pool", standardAlloc("4", "16Gi"), false))
 
 	if err := c.reconcilePool(context.Background(), pool); err != nil {
 		t.Fatalf("reconcilePool: %v", err)
@@ -461,6 +493,7 @@ pools:
 	}}
 	c := newTestController(
 		cm,
+		livePool("pool-a"),
 		makeNode("n1", "pool-a", standardAlloc("4", "16Gi"), true),
 		staleDep,
 		legacyPod,
@@ -547,7 +580,7 @@ func TestReconcilePool_NoSpuriousUpdate(t *testing.T) {
 		PodCPU:    resource.MustParse("500m"),
 		PodMemory: resource.MustParse("512Mi"),
 	}
-	c := newTestController(makeNode("n1", "worker-a", standardAlloc("4", "16Gi"), true))
+	c := newTestController(livePool("worker-a"), makeNode("n1", "worker-a", standardAlloc("4", "16Gi"), true))
 	if err := c.reconcilePool(ctx, pool); err != nil {
 		t.Fatalf("reconcilePool (create): %v", err)
 	}
@@ -618,7 +651,7 @@ func TestReconcilePool_GPUPoolWithoutGPUNodes(t *testing.T) {
 		PodGPU:    resource.MustParse("1"),
 		MinPods:   1,
 	}
-	c := newTestController(makeNode("n1", "gpu-pool", standardAlloc("4", "16Gi"), true)) // no GPU capacity
+	c := newTestController(livePool("gpu-pool"), makeNode("n1", "gpu-pool", standardAlloc("4", "16Gi"), true)) // no GPU capacity
 	if err := c.reconcilePool(context.Background(), pool); err != nil {
 		t.Fatalf("reconcilePool: %v", err)
 	}

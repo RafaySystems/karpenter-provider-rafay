@@ -77,13 +77,18 @@ func envDurationOrDefault(name string, def time.Duration) time.Duration {
 func main() {
 	ctx, op := coreoperator.NewOperator()
 
+	// Both are optional: edge-broker identifies the cluster from the mTLS client certificate and
+	// derives the project itself. The values are only stamped on add/remove payloads and the
+	// config request for diagnostics, and an unset cluster id degrades the broker's fallback
+	// providerID string rather than failing provisioning (see config/deploy/deployment.yaml).
+	// RafayNodeClass has no per-class override, so the controller env is the only place to set them.
 	clusterID := os.Getenv("RAFAY_CLUSTER_ID")
 	projectID := os.Getenv("RAFAY_PROJECT_ID")
 	if clusterID == "" {
-		klog.Warning("RAFAY_CLUSTER_ID is not set; node provisioning will fail — set RAFAY_CLUSTER_ID on the controller (RafayNodeClass has no per-class override)")
+		klog.Info("RAFAY_CLUSTER_ID is not set; the broker identifies the cluster from the client certificate, so provisioning is unaffected — set it to label broker payloads and logs")
 	}
 	if projectID == "" {
-		klog.Warning("RAFAY_PROJECT_ID is not set; node provisioning may fail — set RAFAY_PROJECT_ID on the controller (RafayNodeClass has no per-class override)")
+		klog.Info("RAFAY_PROJECT_ID is not set; the broker derives the project itself, so provisioning is unaffected — set it to label broker payloads and logs")
 	}
 
 	certFolder := strings.TrimSpace(os.Getenv("CERT_FOLDER"))
@@ -92,7 +97,9 @@ func main() {
 	}
 
 	// Default false: same secured dial as edge-client (GetEdgeClientCredentials + TLS to client.crt OU + EDGE_CLIENT_SERVER_PORT).
-	// Set EDGE_BROKER_GRPC_INSECURE=true only for a plaintext broker listener (e.g. rcloud internal :5449).
+	// EDGE_BROKER_GRPC_INSECURE=true is for local development against a broker started with a
+	// plaintext listener only; production brokers serve the Karpenter services solely on the mTLS
+	// edge listener, so an insecure dial there is refused (see docs/architecture.md, TLS / Connectivity).
 	grpcInsecure := false
 	if v, ok := os.LookupEnv("EDGE_BROKER_GRPC_INSECURE"); ok {
 		grpcInsecure = strings.EqualFold(strings.TrimSpace(v), "true")
@@ -170,7 +177,14 @@ func main() {
 	// Start the batch sender + status poller goroutines; they run until ctx is cancelled.
 	rafayClient.StartBatcher(ctx)
 
-	cp := cloudprovider.NewCloudProvider(op.GetClient(), op.Manager.GetAPIReader(), rafayClient, clusterID, projectID, rafayClient.Batcher(), poolBackoff)
+	cp := cloudprovider.NewCloudProvider(op.GetClient(), op.Manager.GetAPIReader(), rafayClient, clusterID, projectID, rafayClient.Batcher(), poolBackoff,
+		// Delete()'s NodeNotRetired / RemoveRetiredOtherMachine / NodeRetiredExternally warnings
+		// land on the NodePool instead of being log-only.
+		cloudprovider.WithEventRecorder(op.EventRecorder),
+		// How long Delete() waits for the machine behind a NodeClaim to stop after its untargeted
+		// remove SUCCEEDED before concluding the platform retired a different machine (never below
+		// the 60-minute default, the broker's own remove timeout).
+		cloudprovider.WithRemoveSettleWindow(envDurationOrDefault("RAFAY_REMOVE_SETTLE_WINDOW", cloudprovider.DefaultRemoveSettleWindow)))
 	cloudProvider := metrics.Decorate(cp)
 	clusterState := state.NewCluster(op.Clock, op.GetClient(), cloudProvider)
 
@@ -185,8 +199,10 @@ func main() {
 		clusterState,
 		op.InstanceTypeStore,
 	)
-	// Headroom pods run in HEADROOM_NAMESPACE; the policy ConfigMap is read from
-	// HEADROOM_CONFIG_NAMESPACE (defaults to the pod namespace).
+	// Headroom pause-pod Deployments run in HEADROOM_NAMESPACE (default "karpenter", the same
+	// namespace as the leader-election Lease — see config/deploy/namespace-karpenter-leader.yaml);
+	// the policy ConfigMap is read from HEADROOM_CONFIG_NAMESPACE, which defaults to the
+	// headroom namespace, not to the namespace this pod runs in.
 	headroomNamespace := strings.TrimSpace(os.Getenv("HEADROOM_NAMESPACE"))
 	if headroomNamespace == "" {
 		headroomNamespace = "karpenter"

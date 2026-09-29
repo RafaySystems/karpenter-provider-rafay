@@ -116,9 +116,9 @@ func newTestBatcher(broker batchBroker) *NodeBatcher {
 	return b
 }
 
-// registerBatch installs an in-progress batch directly (as registerAndAck would), with pollAfter
-// already in the past so pollBatch proceeds immediately. Its operations are marked in-flight, so
-// re-enqueueing them is suppressed exactly as it would be after a real broker ACK.
+// registerBatch installs an in-progress batch directly (as registerAndAck would) so pollBatch
+// proceeds immediately. Its operations are marked in-flight, so re-enqueueing them is suppressed
+// exactly as it would be after a real broker ACK.
 func registerBatch(b *NodeBatcher, batchID, kind string, sentAt time.Time, opIDs ...string) {
 	items := make([]batchItem, 0, len(opIDs))
 	for _, id := range opIDs {
@@ -126,11 +126,10 @@ func registerBatch(b *NodeBatcher, batchID, kind string, sentAt time.Time, opIDs
 	}
 	b.mu.Lock()
 	b.inProgress[batchID] = &inProgressBatch{
-		batchID:   batchID,
-		kind:      kind,
-		items:     items,
-		sentAt:    sentAt,
-		pollAfter: time.Now().Add(-time.Minute),
+		batchID: batchID,
+		kind:    kind,
+		items:   items,
+		sentAt:  sentAt,
 	}
 	for _, id := range opIDs {
 		b.inFlight[id] = struct{}{}
@@ -464,85 +463,156 @@ func TestEnqueueQueueFull(t *testing.T) {
 
 // ──────────────────────────── 3. collectBatch ──────────────────────────────
 
+// manualWindow is a newTimer seam whose batch window closes only when the test fires it, so the
+// collectBatch cases below are deterministic instead of depending on wall-clock windows that a
+// loaded -race runner can miss.
+type manualWindow struct {
+	started chan struct{}  // closed once collectBatch has started its window timer
+	fire    chan time.Time // the timer channel handed to collectBatch
+}
+
+func newManualWindow() *manualWindow {
+	return &manualWindow{started: make(chan struct{}), fire: make(chan time.Time, 1)}
+}
+
+func (w *manualWindow) newTimer(time.Duration) (<-chan time.Time, func()) {
+	close(w.started)
+	return w.fire, func() {}
+}
+
+// close ends the batch window, as the real timer firing would.
+func (w *manualWindow) close() { w.fire <- time.Now() }
+
 func TestCollectBatch(t *testing.T) {
-	tests := []struct {
-		name          string
-		maxBatchSize  int
-		window        time.Duration
-		preQueued     []string // queued before collectBatch starts
-		lateQueued    []string // queued after asserting collectBatch is blocked
-		wantBatch     []string
-		wantQueueLeft int
-	}{
-		{
-			name:         "blocks for first item then window closes",
-			maxBatchSize: 10,
-			window:       100 * time.Millisecond,
-			lateQueued:   []string{"op-1"},
-			wantBatch:    []string{"op-1"},
-		},
-		{
-			name:         "window collects multiple items below max",
-			maxBatchSize: 10,
-			window:       150 * time.Millisecond,
-			preQueued:    []string{"op-1", "op-2", "op-3"},
-			wantBatch:    []string{"op-1", "op-2", "op-3"},
-		},
-		{
-			name:          "maxBatchSize cap returns before window expires",
-			maxBatchSize:  2,
-			window:        10 * time.Second, // far longer than waitTimeout: only the cap can return in time
-			preQueued:     []string{"op-1", "op-2", "op-3"},
-			wantBatch:     []string{"op-1", "op-2"},
-			wantQueueLeft: 1,
-		},
+	t.Run("blocks for first item then window closes", func(t *testing.T) {
+		b := newTestBatcher(&mockBroker{})
+		w := newManualWindow()
+		b.newTimer = w.newTimer
+
+		done := make(chan []batchItem, 1)
+		go func() { done <- b.collectBatch(context.Background()) }()
+
+		// With an empty queue collectBatch must block: no window is started (the timer starts
+		// at the FIRST item, so an idle batcher never spins) and nothing is returned.
+		select {
+		case batch := <-done:
+			t.Fatalf("collectBatch returned %d item(s) before any item was queued", len(batch))
+		case <-w.started:
+			t.Fatal("collectBatch started its window before the first item arrived")
+		case <-time.After(50 * time.Millisecond):
+		}
+
+		b.queue <- batchItem{operationID: "op-1"}
+		select {
+		case <-w.started:
+		case <-time.After(waitTimeout):
+			t.Fatal("collectBatch did not start its window after the first item")
+		}
+		select {
+		case batch := <-done:
+			t.Fatalf("collectBatch returned %d item(s) while the window was still open", len(batch))
+		default:
+		}
+
+		w.close()
+		batch := collectBatchResult(t, done)
+		if got := opIDsOf(batch); !reflect.DeepEqual(got, []string{"op-1"}) {
+			t.Errorf("batch = %v, want [op-1]", got)
+		}
+	})
+
+	t.Run("window collects multiple items below max", func(t *testing.T) {
+		b := newTestBatcher(&mockBroker{})
+		w := newManualWindow()
+		b.newTimer = w.newTimer
+		for _, id := range []string{"op-1", "op-2", "op-3"} {
+			b.queue <- batchItem{operationID: id}
+		}
+
+		done := make(chan []batchItem, 1)
+		go func() { done <- b.collectBatch(context.Background()) }()
+
+		// Once the window is open collectBatch drains what is queued; close the window only
+		// after it has taken every item so the case cannot race the drain.
+		select {
+		case <-w.started:
+		case <-time.After(waitTimeout):
+			t.Fatal("collectBatch did not start its window after the first item")
+		}
+		rfEventually(t, func() bool { return len(b.queue) == 0 }, "collectBatch did not drain the queue")
+		w.close()
+
+		batch := collectBatchResult(t, done)
+		if got := opIDsOf(batch); !reflect.DeepEqual(got, []string{"op-1", "op-2", "op-3"}) {
+			t.Errorf("batch = %v, want [op-1 op-2 op-3]", got)
+		}
+		if left := len(b.queue); left != 0 {
+			t.Errorf("items left in queue = %d, want 0", left)
+		}
+	})
+
+	t.Run("maxBatchSize cap returns before window expires", func(t *testing.T) {
+		b := newTestBatcher(&mockBroker{})
+		w := newManualWindow() // never closed: only the cap can return the batch
+		b.newTimer = w.newTimer
+		b.maxBatchSize = 2
+		for _, id := range []string{"op-1", "op-2", "op-3"} {
+			b.queue <- batchItem{operationID: id}
+		}
+
+		done := make(chan []batchItem, 1)
+		go func() { done <- b.collectBatch(context.Background()) }()
+
+		batch := collectBatchResult(t, done)
+		if got := opIDsOf(batch); !reflect.DeepEqual(got, []string{"op-1", "op-2"}) {
+			t.Errorf("batch = %v, want [op-1 op-2]", got)
+		}
+		if left := len(b.queue); left != 1 {
+			t.Errorf("items left in queue = %d, want 1", left)
+		}
+	})
+
+	t.Run("context cancellation returns what was collected", func(t *testing.T) {
+		b := newTestBatcher(&mockBroker{})
+		w := newManualWindow()
+		b.newTimer = w.newTimer
+		b.queue <- batchItem{operationID: "op-1"}
+		ctx, cancel := context.WithCancel(context.Background())
+
+		done := make(chan []batchItem, 1)
+		go func() { done <- b.collectBatch(ctx) }()
+		select {
+		case <-w.started:
+		case <-time.After(waitTimeout):
+			t.Fatal("collectBatch did not start its window after the first item")
+		}
+		cancel()
+
+		batch := collectBatchResult(t, done)
+		if got := opIDsOf(batch); !reflect.DeepEqual(got, []string{"op-1"}) {
+			t.Errorf("batch = %v, want [op-1] (collected items are returned on cancellation)", got)
+		}
+	})
+}
+
+// collectBatchResult waits for collectBatch's return value.
+func collectBatchResult(t *testing.T, done <-chan []batchItem) []batchItem {
+	t.Helper()
+	select {
+	case batch := <-done:
+		return batch
+	case <-time.After(waitTimeout):
+		t.Fatal("collectBatch did not return in time")
+		return nil
 	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			b := newTestBatcher(&mockBroker{})
-			b.maxBatchSize = tc.maxBatchSize
-			b.batchWindow = tc.window
+}
 
-			for _, id := range tc.preQueued {
-				b.queue <- batchItem{operationID: id}
-			}
-
-			done := make(chan []batchItem, 1)
-			go func() { done <- b.collectBatch(context.Background()) }()
-
-			if len(tc.preQueued) == 0 {
-				// No busy spin: with an empty queue collectBatch must block well past the window,
-				// not return an empty batch.
-				select {
-				case batch := <-done:
-					t.Fatalf("collectBatch returned %d item(s) before any item was queued", len(batch))
-				case <-time.After(5 * tc.window):
-				}
-			}
-
-			for _, id := range tc.lateQueued {
-				b.queue <- batchItem{operationID: id}
-			}
-
-			var batch []batchItem
-			select {
-			case batch = <-done:
-			case <-time.After(waitTimeout):
-				t.Fatal("collectBatch did not return in time")
-			}
-
-			got := make([]string, 0, len(batch))
-			for _, item := range batch {
-				got = append(got, item.operationID)
-			}
-			if !reflect.DeepEqual(got, tc.wantBatch) {
-				t.Errorf("batch = %v, want %v", got, tc.wantBatch)
-			}
-			if left := len(b.queue); left != tc.wantQueueLeft {
-				t.Errorf("items left in queue = %d, want %d", left, tc.wantQueueLeft)
-			}
-		})
+func opIDsOf(batch []batchItem) []string {
+	got := make([]string, 0, len(batch))
+	for _, item := range batch {
+		got = append(got, item.operationID)
 	}
+	return got
 }
 
 // ──────────────────────────── 4. sendBatch partitions ──────────────────────

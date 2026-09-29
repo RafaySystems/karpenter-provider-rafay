@@ -229,7 +229,7 @@ func TestParsePercent(t *testing.T) {
 		{in: " 30% ", want: 0.30},
 		{in: " 30 % ", want: 0.30},
 		{in: "0%", want: 0},
-		{in: "100%", want: 1.0},
+		{in: "100%", wantErr: true}, // above maxBufferPercent: the fraction-of-total model has no fixed point
 		{in: "2.5%", want: 0.025},
 		{in: "", want: 0},
 		{in: "   ", want: 0},
